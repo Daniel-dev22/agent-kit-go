@@ -11,6 +11,14 @@ import (
 	"sync"
 	"time"
 
+	// time/tzdata bakes the IANA timezone database into the binary so
+	// LoadLocation("America/New_York") works on minimal base images that
+	// don't ship /usr/share/zoneinfo (alpine, distroless static, scratch).
+	// Without this the scheduler crashes with "unknown time zone" on any
+	// agent whose runtime stage skipped `apk add tzdata`. Costs ~450 KB
+	// in the final binary — acceptable for the operational safety.
+	_ "time/tzdata"
+
 	"github.com/rs/zerolog/log"
 )
 
