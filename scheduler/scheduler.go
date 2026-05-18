@@ -19,7 +19,7 @@ import (
 	// in the final binary — acceptable for the operational safety.
 	_ "time/tzdata"
 
-	"github.com/rs/zerolog/log"
+	"log/slog"
 )
 
 // FireFunc is the agent-supplied callback invoked when a schedule
@@ -134,13 +134,13 @@ func New(cfg Config) (*Scheduler, error) {
 	if err != nil {
 		// Don't fail New — the caller probably wants to start with an
 		// empty cache instead of refusing to launch. Caller logs the err.
-		log.Warn().Err(err).Str("path", cfg.CachePath).Msg("schedule cache load failed (starting empty)")
+		slog.Warn("schedule cache load failed (starting empty)", "error", err, "path", cfg.CachePath)
 	} else if len(c.Schedules) > 0 || len(c.LastFiredAt) > 0 {
 		if c.LastFiredAt == nil {
 			c.LastFiredAt = map[string]time.Time{}
 		}
 		s.cache = c
-		log.Info().Int("count", len(c.Schedules)).Msg("loaded schedule cache from disk")
+		slog.Info("loaded schedule cache from disk", "count", len(c.Schedules))
 	}
 
 	return s, nil
@@ -207,9 +207,9 @@ func (s *Scheduler) Pull(ctx context.Context) error {
 	s.mu.Unlock()
 
 	if err := saveCache(s.cfg.CachePath, cacheSnapshot); err != nil {
-		log.Warn().Err(err).Str("path", s.cfg.CachePath).Msg("save cache after pull failed")
+		slog.Warn("save cache after pull failed", "error", err, "path", s.cfg.CachePath)
 	}
-	log.Info().Int("count", len(body.Schedules)).Str("node", s.cfg.NodeName).Msg("schedule pull complete")
+	slog.Info("schedule pull complete", "count", len(body.Schedules), "node", s.cfg.NodeName)
 	return nil
 }
 
@@ -269,7 +269,7 @@ func (s *Scheduler) reconcileLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			if err := s.Pull(ctx); err != nil {
-				log.Warn().Err(err).Msg("schedule reconcile pull failed")
+				slog.Warn("schedule reconcile pull failed", "error", err)
 			}
 		}
 	}
@@ -296,12 +296,13 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 // even if the job itself failed to start).
 func (s *Scheduler) dispatch(ctx context.Context, sch LocalSchedule, triggerKey string, missedRecovery bool) {
 	if err := s.cfg.Fire(ctx, sch, triggerKey, missedRecovery); err != nil {
-		log.Error().Err(err).
-			Str("schedule", sch.ID).
-			Str("name", sch.Name).
-			Str("action", sch.Action).
-			Bool("missed_recovery", missedRecovery).
-			Msg("schedule fire callback returned error")
+		slog.Error("schedule fire callback returned error",
+			"error", err,
+			"schedule", sch.ID,
+			"name", sch.Name,
+			"action", sch.Action,
+			"missed_recovery", missedRecovery,
+		)
 		// Fall through — we still stamp LastFiredAt so the next tick
 		// doesn't immediately re-fire the same minute.
 	}
@@ -311,17 +312,17 @@ func (s *Scheduler) dispatch(ctx context.Context, sch LocalSchedule, triggerKey 
 	cacheSnapshot := s.cache
 	s.mu.Unlock()
 	if err := saveCache(s.cfg.CachePath, cacheSnapshot); err != nil {
-		log.Warn().Err(err).Msg("save cache after fire failed")
+		slog.Warn("save cache after fire failed", "error", err)
 	}
 
-	log.Info().
-		Str("schedule", sch.ID).
-		Str("name", sch.Name).
-		Str("action", sch.Action).
-		Str("repo", sch.RepoID).
-		Str("trigger", triggerKey).
-		Bool("missed_recovery", missedRecovery).
-		Msg("schedule fired")
+	slog.Info("schedule fired",
+		"schedule", sch.ID,
+		"name", sch.Name,
+		"action", sch.Action,
+		"repo", sch.RepoID,
+		"trigger", triggerKey,
+		"missed_recovery", missedRecovery,
+	)
 }
 
 // missedRunCheck looks back 24 h per schedule and fires once for the
@@ -345,7 +346,7 @@ func (s *Scheduler) missedRunCheck(ctx context.Context) {
 		if sch.MissPolicy == MissRunAll {
 			// v1 truncation: run-all → run-once-within-24h to avoid a
 			// missed-prune storm on first boot after a long outage.
-			log.Warn().Str("schedule", sch.ID).Msg("run-all miss policy treated as run-once in v1")
+			slog.Warn("run-all miss policy treated as run-once in v1", "schedule", sch.ID)
 		}
 
 		windowEnd := now
@@ -359,11 +360,11 @@ func (s *Scheduler) missedRunCheck(ctx context.Context) {
 			continue
 		}
 
-		log.Info().
-			Str("schedule", sch.ID).
-			Time("missed_window", lastWindow).
-			Time("last_fired", fired).
-			Msg("missed-run recovery: firing catch-up")
+		slog.Info("missed-run recovery: firing catch-up",
+			"schedule", sch.ID,
+			"missed_window", lastWindow,
+			"last_fired", fired,
+		)
 		s.dispatch(ctx, sch, "schedule-recovery", true)
 	}
 }
