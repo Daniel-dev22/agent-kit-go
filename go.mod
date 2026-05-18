@@ -1,6 +1,6 @@
 module github.com/Daniel-dev22/agent-kit-go
 
-go 1.25.0
+go 1.26
 
 require github.com/rs/zerolog v1.33.0
 
