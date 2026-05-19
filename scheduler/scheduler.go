@@ -1,13 +1,14 @@
 package scheduler
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -149,9 +150,8 @@ func New(cfg Config) (*Scheduler, error) {
 // Start launches the 1-min fire loop, the 5-min reconcile loop, and a
 // best-effort initial pull followed by a MissedRunCheck. Returns immediately.
 func (s *Scheduler) Start(ctx context.Context) {
-	s.wg.Add(2)
-	go s.fireLoop(ctx)
-	go s.reconcileLoop(ctx)
+	s.wg.Go(func() { s.fireLoop(ctx) })
+	s.wg.Go(func() { s.reconcileLoop(ctx) })
 	go func() {
 		_ = s.Pull(ctx)
 		s.missedRunCheck(ctx)
@@ -219,7 +219,7 @@ func (s *Scheduler) Schedules() []LocalSchedule {
 	s.mu.RLock()
 	out := append([]LocalSchedule(nil), s.cache.Schedules...)
 	s.mu.RUnlock()
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	slices.SortFunc(out, func(a, b LocalSchedule) int { return cmp.Compare(a.Name, b.Name) })
 	return out
 }
 
@@ -242,7 +242,6 @@ func (s *Scheduler) Cache() Cache {
 // --- internals ---------------------------------------------------------
 
 func (s *Scheduler) fireLoop(ctx context.Context) {
-	defer s.wg.Done()
 	t := time.NewTicker(s.cfg.FireInterval)
 	defer t.Stop()
 	for {
@@ -258,7 +257,6 @@ func (s *Scheduler) fireLoop(ctx context.Context) {
 }
 
 func (s *Scheduler) reconcileLoop(ctx context.Context) {
-	defer s.wg.Done()
 	t := time.NewTicker(s.cfg.PullInterval)
 	defer t.Stop()
 	for {

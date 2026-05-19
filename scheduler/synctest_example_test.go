@@ -19,7 +19,7 @@ import (
 // with deterministic timing.
 //
 // The pattern:
-//  1. Wrap the entire test body in synctest.Run.
+//  1. Wrap the entire test body in synctest.Test(t, func(t *testing.T) { ... }).
 //  2. Inside, time.Sleep / time.NewTicker / time.After all use the
 //     synthetic clock — they don't block the real test process.
 //  3. Call synctest.Wait() to wait until every goroutine in the bubble
@@ -27,10 +27,9 @@ import (
 //     everything to quiescence" barrier.
 //
 // Apply this pattern to all retry/backoff/cron tests that currently
-// rely on short real-time Sleeps. See plan: Wave 4e in
-// /home/user/.claude/plans/review-all-of-our-bubbly-rain.md.
+// rely on short real-time Sleeps.
 func TestReconcileLoopUnderVirtualTime(t *testing.T) {
-	synctest.Run(func() {
+	synctest.Test(t, func(t *testing.T) {
 		var pullCount atomic.Int64
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			pullCount.Add(1)
