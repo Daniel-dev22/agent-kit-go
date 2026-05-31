@@ -239,6 +239,31 @@ func (s *Scheduler) Cache() Cache {
 	return c
 }
 
+// FireMatching dispatches every enabled schedule for which pred returns true,
+// labelling each fire with triggerKey. Intended for event-triggered schedules
+// (Schedule.On != "") fired on demand by a Chain or other orchestrator — NOT by
+// the cron tick. Returns the number of schedules dispatched.
+//
+// dispatch still stamps LastFiredAt + persists the cache (harmless for
+// On-schedules, whose LastFiredAt is never consulted by Matches/missed-run
+// recovery — both short-circuit on On != ""). The Chain keeps its own
+// per-day markers for idempotency; LastFiredAt is not relied on here.
+func (s *Scheduler) FireMatching(ctx context.Context, triggerKey string, pred func(LocalSchedule) bool) int {
+	s.mu.RLock()
+	schedules := append([]LocalSchedule(nil), s.cache.Schedules...)
+	s.mu.RUnlock()
+
+	n := 0
+	for _, sch := range schedules {
+		if !sch.Enabled || pred == nil || !pred(sch) {
+			continue
+		}
+		s.dispatch(ctx, sch, triggerKey, false)
+		n++
+	}
+	return n
+}
+
 // --- internals ---------------------------------------------------------
 
 func (s *Scheduler) fireLoop(ctx context.Context) {

@@ -16,6 +16,13 @@ import (
 // Exported so tests (and the kit's own MissedRunCheck) can re-use the same
 // predicate — callers normally do not need to invoke it directly.
 func Matches(s Schedule, now time.Time, tz *time.Location) bool {
+	// Event-triggered schedules (e.g. {"on":"after_wave"}) never fire on the
+	// clock — they are dispatched on demand via FireSchedule when an upstream
+	// condition is met. Guard here so neither the 1-min tick nor missed-run
+	// recovery (which calls findLastFireWindow → Matches) ever fires them.
+	if s.On != "" {
+		return false
+	}
 	now = now.In(tz)
 	if s.IntervalMinutes != nil && *s.IntervalMinutes > 0 {
 		minutesSinceMidnight := now.Hour()*60 + now.Minute()
