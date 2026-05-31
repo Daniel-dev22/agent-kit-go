@@ -5,11 +5,19 @@ import "time"
 // Schedule is the cron-like shape pulled from controller. Mirrors
 // scheduler-api/main.go so the JSON wire format is identical whether the
 // schedule fires from the central scheduler-api or from an agent.
+//
+// On is a non-cron trigger sentinel: when set (e.g. {"on":"after_wave"}), the
+// schedule NEVER fires on the clock — Matches always returns false and
+// missed-run recovery skips it. Such rows are fired on demand by an agent's
+// chain controller via FireSchedule when an upstream condition is met (e.g.
+// "the nightly backup+copy wave finished"). Days/Hours/Minute are ignored when
+// On is set. Empty On means a normal cron schedule.
 type Schedule struct {
 	Days            []string `json:"days"`
 	Hours           []string `json:"hours"`
 	Minute          string   `json:"minute"`
 	IntervalMinutes *int     `json:"interval_minutes,omitempty"`
+	On              string   `json:"on,omitempty"`
 }
 
 // MissPolicy controls catch-up behaviour when an agent boots after
