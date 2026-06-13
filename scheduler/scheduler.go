@@ -36,12 +36,12 @@ import (
 // duplicacy-agent's existing telemetry shape.
 //
 // Returning an error does NOT stop the scheduler — it is logged and the
-// next tick proceeds normally. The kit stamps LastFiredAt regardless of
-// the FireFunc's return value (i.e. firing happened from the schedule's
-// perspective even if the job itself failed to start; whether to retry
-// is up to the agent's job runner). Callers that want to inhibit
-// LastFiredAt on failure should panic — but don't, just handle it inside
-// the FireFunc.
+// next tick proceeds normally. A non-nil error means the fire did NOT
+// happen: the kit leaves LastFiredAt un-stamped so the window is retried
+// (next matching minute and by the periodic missedRunCheck). Return nil
+// ONLY when the work was actually dispatched; return an error for any
+// transient failure (secret vend timeout, repo not yet loaded, job failed
+// to start) so it gets another attempt rather than being silently lost.
 type FireFunc func(ctx context.Context, sch LocalSchedule, triggerKey string, missedRecovery bool) error
 
 // Config configures the scheduler. PullURL, NodeName, CachePath, and
@@ -294,6 +294,15 @@ func (s *Scheduler) reconcileLoop(ctx context.Context) {
 			if err := s.Pull(ctx); err != nil {
 				slog.Warn("schedule reconcile pull failed", "error", err)
 			}
+			// Re-run missed-run recovery every reconcile tick, not just once at
+			// boot. A fire that errored (dispatch left it un-stamped) or a window
+			// missed while the repo registry was still loading would otherwise sit
+			// unrecovered until the next process restart — on hosts that run for
+			// days, that means a permanently lost daily backup. This makes a failed
+			// window self-heal within one PullInterval (~5 min). Idempotent: a
+			// window already fired successfully is stamped in LastFiredAt and
+			// skipped; bounded by the 24h lookback in findLastFireWindow.
+			s.missedRunCheck(ctx)
 		}
 	}
 }
@@ -314,20 +323,32 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 	}
 }
 
-// dispatch calls FireFunc and stamps LastFiredAt on the cache (regardless
-// of FireFunc's return value — firing happened from the kit's perspective
-// even if the job itself failed to start).
+// dispatch calls FireFunc and stamps LastFiredAt on the cache ONLY when the
+// fire succeeded. A failed fire (FireFunc returns an error) is deliberately
+// left un-stamped so missedRunCheck retries it — see the long note below.
+//
+// Why not stamp on failure: LastFiredAt is the persistent "this window was
+// successfully fired" marker, and missedRunCheck is its only consumer
+// (tick() never reads it). Stamping on failure used to mark a missed backup
+// as done forever — a transient dependency error at the fire minute (secret
+// vend timeout, controller/DB blip, a startup race where the repo registry
+// isn't loaded yet) permanently lost that window with no retry. Leaving it
+// un-stamped lets both the next matching cron minute AND the periodic
+// missedRunCheck (reconcile loop) re-attempt until one succeeds, bounded by
+// the 24h recovery window. There is no within-minute double-fire risk: the
+// 1-minute ticker delivers at most one tick per wall-clock minute, so a
+// single-minute cron matcher cannot fire twice in the same window regardless
+// of the stamp.
 func (s *Scheduler) dispatch(ctx context.Context, sch LocalSchedule, triggerKey string, missedRecovery bool) {
 	if err := s.cfg.Fire(ctx, sch, triggerKey, missedRecovery); err != nil {
-		slog.Error("schedule fire callback returned error",
+		slog.Error("schedule fire callback returned error; leaving window un-stamped for retry",
 			"error", err,
 			"schedule", sch.ID,
 			"name", sch.Name,
 			"action", sch.Action,
 			"missed_recovery", missedRecovery,
 		)
-		// Fall through — we still stamp LastFiredAt so the next tick
-		// doesn't immediately re-fire the same minute.
+		return
 	}
 
 	s.mu.Lock()
