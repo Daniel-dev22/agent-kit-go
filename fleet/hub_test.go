@@ -46,8 +46,8 @@ func TestHubSnapshotNow(t *testing.T) {
 
 func TestHubBroadcastDoesNotBlockOnSlowConsumer(t *testing.T) {
 	h := NewHub(func(context.Context) (int, error) { return 1, nil }, 0)
-	// Subscriber that never drains. Buffer is 4; broadcasting more than 4 times
-	// must not block (frames are dropped).
+	// Subscriber that never drains. The conflating 1-slot mailbox must keep
+	// replacing the pending frame rather than blocking the broadcaster.
 	_, unsub := h.Subscribe()
 	defer unsub()
 	done := make(chan struct{})
@@ -61,5 +61,31 @@ func TestHubBroadcastDoesNotBlockOnSlowConsumer(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("broadcast blocked on a slow consumer")
+	}
+}
+
+// TestHubBroadcastConflatesToLatest is the regression guard for the stale-fleet
+// bug: a slow consumer must observe the NEWEST snapshot, not an old one that was
+// queued first. The previous cap-4 drop-newest behaviour kept the first frames
+// and discarded later ones, so a fast backup's final "completed" frame was lost
+// and the controller's fleet cache stayed stale ~24h.
+func TestHubBroadcastConflatesToLatest(t *testing.T) {
+	h := NewHub(func(context.Context) (int, error) { return 0, nil }, 0)
+	ch, unsub := h.Subscribe()
+	defer unsub()
+
+	// Burst many frames with no reader draining in between (mimics a fast
+	// backup's tight job-event burst against a momentarily-busy consumer).
+	for i := 1; i <= 50; i++ {
+		h.broadcast(i)
+	}
+
+	select {
+	case v := <-ch:
+		if v != 50 {
+			t.Fatalf("got %d, want the latest (50) — conflation kept a stale frame", v)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out: no frame retained")
 	}
 }
