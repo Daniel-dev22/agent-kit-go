@@ -4,8 +4,15 @@
 //
 // A single broadcaster goroutine builds at most one snapshot per coalescing
 // window (driven by Trigger() calls and/or an optional periodic tick) and fans
-// it out to all subscribers. Slow subscribers drop frames rather than stalling
-// the broadcaster, and the broadcaster NEVER unregisters a subscriber itself —
+// it out to all subscribers. Each subscriber has a conflating 1-slot mailbox:
+// when a consumer is slow, the broadcaster REPLACES the pending frame with the
+// newer one rather than dropping the newer one or stalling. A snapshot is a
+// full replacing state, so a consumer only ever needs the latest — never a
+// backlog of stale snapshots. This matters because the agent broadcasts on job
+// state-change only: if a fast backup's final "completed" frame were dropped
+// (the old cap-4 drop-newest behaviour), the controller's fleet cache would
+// stay stale for ~24h until the next job. The broadcaster NEVER unregisters a
+// subscriber itself —
 // cleanup happens exactly once, via the closure returned by Subscribe(), guarded
 // against double-close. This is the correct shape; duplicacy-agent-api's
 // hand-rolled hub previously had two unregister paths plus an unconditional
@@ -31,6 +38,15 @@ type Hub[T any] struct {
 	subs    map[chan T]struct{}
 	trigger chan struct{} // buffered cap 1 so coalescing producers never block
 }
+
+// DefaultLivenessTick is the standard periodic rebuild cadence agents pass to
+// NewHub. With conflating delivery the event-driven Trigger() path already
+// guarantees the latest snapshot is never dropped, so this tick is pure
+// belt-and-suspenders (it only covers the rare connect/subscribe race) and is
+// deliberately slow to stay cheap on low-power hosts (e.g. a Pi querying a large
+// events.sqlite). Both agents build their hub with this constant so they cannot
+// drift apart again.
+const DefaultLivenessTick = 30 * time.Second
 
 // NewHub returns a hub that builds snapshots via build. If tick > 0 the hub also
 // rebuilds on that interval (liveness); tick == 0 means trigger-only.
@@ -84,12 +100,22 @@ func (h *Hub[T]) broadcast(snap T) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for c := range h.subs {
+		// Conflating send into the subscriber's 1-slot mailbox: if a frame is
+		// still pending (slow consumer), replace it with this newer snapshot so
+		// the consumer always observes the latest state and never a stale one.
+		// Single-broadcaster/single-consumer makes the drain-then-put safe: only
+		// this goroutine ever sends, so the slot can only be filled here.
 		select {
 		case c <- snap:
 		default:
-			// Slow consumer — drop this frame. The WS read pump detects the
-			// disconnect and calls the unsubscribe closure; we never unregister
-			// from here, so there is no second close path.
+			select { // discard the stale pending frame (consumer may have just taken it)
+			case <-c:
+			default:
+			}
+			select { // install the newest frame
+			case c <- snap:
+			default:
+			}
 		}
 	}
 }
@@ -98,7 +124,10 @@ func (h *Hub[T]) broadcast(snap T) {
 // idempotent unsubscribe closure. Callers MUST call unsubscribe (typically via
 // defer) once they stop reading. Calling it more than once is safe.
 func (h *Hub[T]) Subscribe() (<-chan T, func()) {
-	c := make(chan T, 4)
+	// Cap-1 conflating mailbox: broadcast() keeps it holding the latest snapshot
+	// (see broadcast's drain-then-put), so a slow consumer reads current state
+	// rather than a backlog of stale frames.
+	c := make(chan T, 1)
 	h.mu.Lock()
 	h.subs[c] = struct{}{}
 	h.mu.Unlock()
