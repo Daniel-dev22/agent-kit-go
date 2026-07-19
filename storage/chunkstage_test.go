@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -48,7 +49,7 @@ func TestChunkStageFullWriteComplete(t *testing.T) {
 		t.Fatalf("expected 4 chunks missing, got %d", nchunks)
 	}
 	for i := 0; i < nchunks; i++ {
-		if err := st.WriteChunk(i, bytes.NewReader(chunkOf(content, i, chunkSize))); err != nil {
+		if err := st.WriteChunk(context.Background(), i, bytes.NewReader(chunkOf(content, i, chunkSize))); err != nil {
 			t.Fatalf("WriteChunk %d: %v", i, err)
 		}
 	}
@@ -91,7 +92,7 @@ func TestChunkStageResume(t *testing.T) {
 		t.Fatalf("OpenStage 1: %v", err)
 	}
 	for _, i := range []int{0, 2, 4} {
-		if err := st1.WriteChunk(i, bytes.NewReader(chunkOf(content, i, chunkSize))); err != nil {
+		if err := st1.WriteChunk(context.Background(), i, bytes.NewReader(chunkOf(content, i, chunkSize))); err != nil {
 			t.Fatalf("WriteChunk %d: %v", i, err)
 		}
 	}
@@ -118,7 +119,7 @@ func TestChunkStageResume(t *testing.T) {
 	// Write ONLY the missing chunks; the previously-written ones must not need
 	// rewriting for Complete to succeed.
 	for _, i := range missing {
-		if err := st2.WriteChunk(i, bytes.NewReader(chunkOf(content, i, chunkSize))); err != nil {
+		if err := st2.WriteChunk(context.Background(), i, bytes.NewReader(chunkOf(content, i, chunkSize))); err != nil {
 			t.Fatalf("WriteChunk resume %d: %v", i, err)
 		}
 	}
@@ -154,7 +155,7 @@ func TestChunkStageSha256Mismatch(t *testing.T) {
 		t.Fatalf("OpenStage: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if err := st.WriteChunk(i, bytes.NewReader(chunkOf(content, i, chunkSize))); err != nil {
+		if err := st.WriteChunk(context.Background(), i, bytes.NewReader(chunkOf(content, i, chunkSize))); err != nil {
 			t.Fatalf("WriteChunk %d: %v", i, err)
 		}
 	}
@@ -172,6 +173,34 @@ func TestChunkStageSha256Mismatch(t *testing.T) {
 	}
 	if _, statErr := os.Stat(finalDst); !os.IsNotExist(statErr) {
 		t.Errorf("finalDst must not exist after mismatch, stat err=%v", statErr)
+	}
+}
+
+// TestChunkStageWriteChunkCtxCancel verifies a cancelled context aborts the
+// (potentially slow, network-backed) chunk read+write and leaves the chunk
+// unmarked so a resume re-pulls it.
+func TestChunkStageWriteChunkCtxCancel(t *testing.T) {
+	dir := t.TempDir()
+	const chunkSize = 1024
+	content, sum := makeContent(chunkSize * 2)
+
+	st, err := OpenStage(dir, sum, int64(len(content)), chunkSize)
+	if err != nil {
+		t.Fatalf("OpenStage: %v", err)
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+	err = st.WriteChunk(ctx, 0, bytes.NewReader(chunkOf(content, 0, chunkSize)))
+	if err == nil {
+		t.Fatal("WriteChunk with a cancelled context should return an error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WriteChunk error = %v, want context.Canceled", err)
+	}
+	if bm := st.Bitmap(); bm[0] {
+		t.Error("chunk 0 must not be marked received after a cancelled write")
 	}
 }
 

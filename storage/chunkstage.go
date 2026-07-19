@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -98,6 +99,10 @@ func OpenStage(dir, sha256hex string, size, chunkSize int64) (*ChunkStage, error
 		f.Close()
 		return nil, fmt.Errorf("size .part: %w", err)
 	}
+	// fsync the parent dir ONCE so the .part directory entry is durable from the
+	// start (a crash can't lose the .part while a later bitmap rename survives).
+	// Done here, not per-chunk, to avoid a per-chunk parent-fsync perf cost.
+	syncParentDir(s.partPath)
 	s.f = f
 
 	// Load the bitmap sidecar; only trust it when its geometry matches, so a
@@ -119,28 +124,37 @@ func OpenStage(dir, sha256hex string, size, chunkSize int64) (*ChunkStage, error
 // short final chunk), so an over-long reader cannot bleed into the next chunk.
 // Writing an already-received chunk is allowed and idempotent (it re-lands the
 // bytes and re-marks). The data is fsynced before the bitmap is persisted.
-func (s *ChunkStage) WriteChunk(index int, r io.Reader) error {
+//
+// ctx cancels the (potentially slow, network-backed) read+write promptly. The
+// stage mutex is held only to validate/snapshot geometry and to persist the mark
+// — NOT across the blocking copy+fsync — so a stalled peer on one chunk never
+// wedges Bitmap()/Missing()/other WriteChunk calls. pwrite at distinct offsets
+// is safe without the lock; the durability contract (fsync-before-mark) is
+// preserved because the fsync completes before the re-lock that marks.
+func (s *ChunkStage) WriteChunk(ctx context.Context, index int, r io.Reader) error {
 	if r == nil {
 		return errors.New("storage: WriteChunk nil reader")
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.f == nil {
+		s.mu.Unlock()
 		return errors.New("storage: WriteChunk on closed stage")
 	}
 	if index < 0 || index >= s.nchunks {
+		s.mu.Unlock()
 		return fmt.Errorf("storage: chunk index %d out of range [0,%d)", index, s.nchunks)
 	}
-
+	f := s.f
 	offset := int64(index) * s.chunkSize
 	limit := s.chunkSize
 	if rem := s.size - offset; rem < limit {
 		limit = rem
 	}
+	s.mu.Unlock() // release across the blocking network read + fsync
 
-	ow := io.NewOffsetWriter(s.f, offset)
+	ow := io.NewOffsetWriter(f, offset)
 	bufPtr := bufPool.Get().(*[]byte)
-	n, err := io.CopyBuffer(ow, io.LimitReader(r, limit), *bufPtr)
+	n, err := io.CopyBuffer(ow, io.LimitReader(&ctxReader{ctx: ctx, r: r}, limit), *bufPtr)
 	bufPool.Put(bufPtr)
 	if err != nil {
 		return fmt.Errorf("write chunk %d: %w", index, err)
@@ -148,10 +162,16 @@ func (s *ChunkStage) WriteChunk(index int, r io.Reader) error {
 	if n != limit {
 		return fmt.Errorf("chunk %d: wrote %d bytes, want %d", index, n, limit)
 	}
-
 	// fsync data BEFORE marking so a crash never marks an absent chunk.
-	if err := s.f.Sync(); err != nil {
+	if err := f.Sync(); err != nil {
 		return fmt.Errorf("fsync chunk %d: %w", index, err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.f == nil {
+		// Stage was Closed/Completed concurrently; don't mark a torn transfer.
+		return errors.New("storage: stage closed during WriteChunk")
 	}
 	s.received[index] = true
 	if err := s.persistBitmapLocked(); err != nil {
