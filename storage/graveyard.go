@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -104,6 +105,74 @@ func (g Graveyard) Sweep(keepDays int, now time.Time) (int, error) {
 		}
 	}
 	return pruned, firstErr
+}
+
+// FileGraveyardDir returns the directory under graveyard/<fileID> holding one
+// file's soft-deleted copies. Symmetric with VersionLayout.FileVersionsDir.
+func (g Graveyard) FileGraveyardDir(fileID string) string {
+	return filepath.Join(g.AccountRoot, "graveyard", fileID)
+}
+
+// ListGraveyard returns the soft-delete entry filenames for one file, newest
+// last (the ISO-timestamp prefix sorts lexicographically). Empty slice (no
+// error) if the dir doesn't exist. Mirrors VersionLayout.ListVersions.
+func (g Graveyard) ListGraveyard(fileID string) ([]string, error) {
+	dir := g.FileGraveyardDir(fileID)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out := make([]string, 0, len(ents))
+	for _, e := range ents {
+		if !e.IsDir() {
+			out = append(out, e.Name())
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// GraveyardPath returns the absolute path to one specific soft-deleted entry.
+// Caller is responsible for stat'ing it (a concurrent Sweep may have pruned it).
+// Mirrors VersionLayout.VersionPath.
+func (g Graveyard) GraveyardPath(fileID, entryName string) string {
+	return filepath.Join(g.FileGraveyardDir(fileID), entryName)
+}
+
+// ListGraveyardIDs returns the fileIDs that currently have at least one
+// recoverable soft-deleted entry — i.e. the immediate subdirs of graveyard/.
+// Because Sweep removes a subdir once its last entry expires, this is exactly
+// the still-recoverable set, obtained in a single ReadDir. Empty slice (no
+// error) if graveyard/ doesn't exist.
+func (g Graveyard) ListGraveyardIDs() ([]string, error) {
+	root := filepath.Join(g.AccountRoot, "graveyard")
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out := make([]string, 0, len(ents))
+	for _, e := range ents {
+		if e.IsDir() {
+			out = append(out, e.Name())
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// ParseStamp converts an ISO entry-timestamp prefix ("2026-05-14T03-00-00Z",
+// as produced by Rotate/Bury and returned by SplitVersionName) back to a
+// time.Time. Exported so out-of-module callers (e.g. an agent listing versions
+// over HTTP) can render the deletion/rotation time without duplicating the
+// filesystem-safe stamp format.
+func ParseStamp(iso string) (time.Time, error) {
+	return parseGraveStamp(iso)
 }
 
 // parseGraveStamp accepts "2026-05-14T03-00-00Z" (our format) and converts
