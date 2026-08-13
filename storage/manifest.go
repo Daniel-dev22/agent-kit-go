@@ -21,7 +21,7 @@ type Manifest struct {
 	Files     map[string]ManifestFile `json:"files"`
 }
 
-// ManifestFile mirrors the schema layout from plan §F.4.3. Binary files
+// ManifestFile is one file's entry in the manifest. Binary files
 // populate MD5; native files (Sheets/Docs) leave it empty and rely on
 // HeadRevisionID + Version + Size for change detection.
 type ManifestFile struct {

@@ -1,7 +1,6 @@
 // Package logging centralizes slog setup + a Fatal helper for standalone
-// Go agents that depend on agent-kit-go. Mirrors the
-// controller/shared/logutil package one-for-one — keep them in sync if
-// you change the signature so both ecosystems behave identically.
+// Go agents that depend on agent-kit-go, so every agent emits the same
+// structured log shape without each one wiring its own handler.
 //
 // Usage in an agent's main:
 //

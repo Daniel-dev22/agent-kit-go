@@ -1,16 +1,17 @@
 // Package eventoutbox is a durable, restart-surviving queue of outbound job
-// lifecycle events POSTed to controller. It is duplicacy-agent-api's proven
-// outbox promoted to the kit so gdrive-agent gains the same durability (its
-// push was previously fire-and-forget, so a failed terminal POST could leave a
-// central row stuck "running").
+// lifecycle events POSTed to a controller.
+//
+// It exists because the obvious alternative — fire-and-forget POSTs — loses a
+// terminal event whenever the controller is briefly unreachable, and a lost
+// terminal event leaves the central row stuck "running" forever. Nothing
+// retries it, because nothing recorded that it failed.
 //
 // Backed by a `pending_events` table on a caller-supplied *sql.DB — the package
 // is driver-agnostic (the agent opens the DB with its own sqlite driver and may
 // share it with other tables). Enqueue persists the event then fires an
 // immediate best-effort push; a drain loop retries the backlog on an interval,
-// oldest-first, bailing on the first failure (controller is probably down)
-// to retry next tick. The schema matches duplicacy's existing table exactly, so
-// adopting this package requires no migration of a live events.sqlite.
+// oldest-first, bailing on the first failure (the controller is probably down)
+// to retry next tick.
 package eventoutbox
 
 import (

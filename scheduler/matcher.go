@@ -9,8 +9,8 @@ import (
 // Matches returns true if `now` (interpreted in `tz`) falls inside one of
 // `s`'s configured fire windows.
 //
-// Mirrors scheduler-api/main.go's matcher verbatim so the JSON Schedule
-// shape behaves identically whether the central scheduler-api or an agent
+// Mirrors the controller's scheduler's matcher verbatim so the JSON Schedule
+// shape behaves identically whether the controller or an agent
 // is evaluating it.
 //
 // Exported so tests (and the kit's own MissedRunCheck) can re-use the same

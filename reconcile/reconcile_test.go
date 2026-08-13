@@ -33,7 +33,7 @@ func TestRunPushesSnapshotImmediatelyAndConverges(t *testing.T) {
 	cfg := Config{
 		Client:   srv.Client(),
 		URL:      srv.URL,
-		Site:     "kd",
+		Site:     "site-a",
 		Node:     "nas",
 		Interval: 50 * time.Millisecond,
 		Snapshot: func(ctx context.Context) ([]jobstore.JobRef, error) {
@@ -65,7 +65,7 @@ func TestRunPushesSnapshotImmediatelyAndConverges(t *testing.T) {
 		t.Fatalf("expected at least one snapshot push, got 0")
 	}
 	first := got[0]
-	if first.Site != "kd" || first.Node != "nas" {
+	if first.Site != "site-a" || first.Node != "nas" {
 		t.Errorf("site/node = %q/%q, want kd/nas", first.Site, first.Node)
 	}
 	if first.SnapshotAt.IsZero() {
@@ -94,7 +94,7 @@ func TestRunRetriesAfterFailure(t *testing.T) {
 	cfg := Config{
 		Client:   srv.Client(),
 		URL:      srv.URL,
-		Site:     "ng",
+		Site:     "site-b",
 		Node:     "nuc",
 		Interval: 40 * time.Millisecond,
 		Snapshot: func(ctx context.Context) ([]jobstore.JobRef, error) {

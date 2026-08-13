@@ -1,16 +1,17 @@
-// Package scheduler implements a per-agent cron scheduler shared between
-// the standalone "agent API" services that pair with the controller
-// cluster (duplicacy-agent, gdrive-agent, future agents).
+// Package scheduler implements a per-agent cron scheduler for standalone
+// "agent API" services that take their schedule list from a central
+// controller but fire it locally.
 //
 // # Operating model
 //
-// The agent owns its own cron scheduling — controller scheduler-api
-// and EDA rulebooks are NOT in the firing path. Each agent runs:
+// The agent owns its own cron scheduling — the controller is NOT in the
+// firing path, so schedules keep firing while it is unreachable. Each
+// agent runs:
 //
 //  1. A 1-minute fire loop that walks the in-memory schedule cache and
 //     calls the agent-provided FireFunc for any schedule whose cron
 //     expression matches the current minute.
-//  2. A 5-minute reconcile loop that re-pulls the schedule list from
+//  2. A 5-minute reconcile loop that re-pulls the schedule list from the
 //     controller (GET <PullURL>) and replaces the local cache,
 //     preserving LastFiredAt entries for surviving schedule IDs.
 //  3. A persistent on-disk cache (atomic write to a JSON file) so a pod
@@ -20,9 +21,9 @@
 //
 // The agent provides:
 //
-//   - The PullURL (e.g. "https://controller.../api/duplicacy/schedules?node=nas")
-//   - A FireFunc callback that runs the actual job (duplicacy CLI invocation,
-//     gdrive backup, etc.)
+//   - The PullURL (e.g. "https://controller.example.com/api/schedules?node=node-a")
+//   - A FireFunc callback that runs the actual job (a CLI invocation, a
+//     backup, whatever the agent does)
 //   - A NodeName used only for logging
 //   - A CachePath for disk persistence (typically under CONFIG_DIR)
 //   - Optional: HTTP client (defaults to http.DefaultClient — usually you
@@ -31,9 +32,9 @@
 //
 // # Cron semantics
 //
-// Identical to controller scheduler-api/main.go's matcher so the
-// JSON shape and matching behaviour are identical whether a schedule
-// fires from the central scheduler-api or from the agent. Days use the
+// Matches the controller's own matcher, so the JSON shape and matching
+// behaviour are identical whether a schedule fires centrally or on the
+// agent. Days use the
 // 3-letter lowercase weekday names (mon, tue, ...). Hours and Minute are
 // numeric strings. "*" wildcards both days and hours. IntervalMinutes
 // overrides the days/hours/minute fields when set.

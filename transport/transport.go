@@ -1,17 +1,15 @@
-// Package transport provides the shared outbound HTTP building blocks every
-// controller agent needs to call back into the cluster: a constant-bearer
-// round-tripper and a pooled *http.Transport that (optionally) rewrites the
-// dial target to a local Traefik container while preserving the URL authority
-// as the Host header + TLS SNI.
+// Package transport provides the outbound HTTP building blocks an agent needs
+// to call back into its controller: a constant-bearer round-tripper and a
+// pooled *http.Transport that (optionally) rewrites the dial target to a local
+// reverse proxy while preserving the URL authority as the Host header + TLS
+// SNI. That rewrite is what lets an agent address the controller by its public
+// name while the bytes actually go to a sidecar proxy on the same host, which
+// is where mutual TLS is attached.
 //
-// This is the DRY promotion of two byte-for-byte-equivalent private copies:
-//   - gdrive-agent   cmd/gdrive-agent/main.go : newRouterClient + bearerAuthRoundTripper
-//   - duplicacy-agent-api network.go          : buildControlCenterClient + bearerAuthRoundTripper
-//
-// The two agents historically built the same shape and differed only in a few
-// pool knobs; those differences are quoted in NewRouterTransport so a later
-// migration onto this package is a deliberate behavioral-parity decision, not
-// an accident.
+// It exists because two agents had built the same client independently and
+// differed only in a few pool knobs. Those differences are quoted in
+// NewRouterTransport so adopting this package is a deliberate
+// behavioural-parity decision rather than an accident.
 package transport
 
 import (
@@ -21,11 +19,12 @@ import (
 	"time"
 )
 
-// Canonical pool/timeout settings. Both agents agree on the shared shape
-// (MaxIdleConns 20, MaxIdleConnsPerHost 10, Dialer.Timeout 5s, Client 30s) and
-// differ only on the rows marked (*), reconciled here to gdrive's values:
+// Canonical pool/timeout settings. The two pre-existing implementations agreed
+// on the shared shape (MaxIdleConns 20, MaxIdleConnsPerHost 10, Dialer.Timeout
+// 5s, Client 30s) and differed only on the rows marked (*), reconciled here to
+// the longer-lived, HTTP/2-enabled values:
 //
-//	                      gdrive         duplicacy          canonical (here)
+//	                      impl A         impl B             canonical (here)
 //	Dialer.Timeout        5s             5s                 5s
 //	Dialer.KeepAlive (*)  30s            15s                30s
 //	MaxIdleConns          20             20                 20

@@ -2,9 +2,9 @@ package scheduler
 
 import "time"
 
-// Schedule is the cron-like shape pulled from controller. Mirrors
-// scheduler-api/main.go so the JSON wire format is identical whether the
-// schedule fires from the central scheduler-api or from an agent.
+// Schedule is the cron-like shape pulled from the controller. Mirrors
+// the controller's scheduler so the JSON wire format is identical whether the
+// schedule fires from the controller or from an agent.
 //
 // On is a non-cron trigger sentinel: when set (e.g. {"on":"after_wave"}), the
 // schedule NEVER fires on the clock — Matches always returns false and
@@ -35,7 +35,7 @@ const (
 	MissRunAll MissPolicy = "run-all"
 )
 
-// LocalSchedule is one row pulled from controller plus the agent-side
+// LocalSchedule is one row pulled from the controller plus the agent-side
 // bookkeeping the kit maintains.
 //
 // Action is an opaque string — each agent defines its own action vocabulary
