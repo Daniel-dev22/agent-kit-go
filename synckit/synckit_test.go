@@ -15,7 +15,7 @@ var (
 	tB = time.Date(2026, 7, 5, 11, 0, 0, 0, time.UTC)
 )
 
-// TestWins mirrors controller synckit's TestWins: strictly-newer wins, ties
+// TestWins pins the LWW rule against the server engine: strictly-newer wins, ties
 // keep existing except a tombstone beats a same-instant non-delete.
 func TestWins(t *testing.T) {
 	cases := []struct {

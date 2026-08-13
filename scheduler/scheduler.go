@@ -33,7 +33,7 @@ import (
 //   - "schedule-recovery" for a missed-run catch-up fire from Start.
 //
 // `missedRecovery` mirrors triggerKey for convenience and matches
-// duplicacy-agent's existing telemetry shape.
+// the agents' existing telemetry shape.
 //
 // Returning an error does NOT stop the scheduler — it is logged and the
 // next tick proceeds normally. A non-nil error means the fire did NOT
@@ -49,7 +49,7 @@ type FireFunc func(ctx context.Context, sch LocalSchedule, triggerKey string, mi
 type Config struct {
 	// PullURL is the full URL the scheduler GETs to refresh the local
 	// schedule list, e.g.
-	// "https://controller.example.com:1443/api/duplicacy/schedules?node=nas".
+	// "https://controller.example.com/api/schedules?node=node-a".
 	// The kit does not format this — callers substitute their own node.
 	PullURL string
 
@@ -71,7 +71,7 @@ type Config struct {
 	Fire FireFunc
 
 	// Timezone for cron evaluation. Defaults to America/New_York to
-	// match the rest of the controller stack.
+	// match the rest of the stack.
 	Timezone *time.Location
 
 	// FireInterval is the cron tick. Defaults to 1 * time.Minute. Tests
@@ -165,7 +165,7 @@ func (s *Scheduler) Stop() {
 	s.wg.Wait()
 }
 
-// Pull re-fetches the schedule list from controller and replaces
+// Pull re-fetches the schedule list from the controller and replaces
 // the local cache. Exported so an HTTP /schedules/refresh handler can
 // nudge an early reconcile after a CRUD write.
 //

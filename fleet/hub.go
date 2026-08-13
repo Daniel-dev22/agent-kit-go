@@ -1,6 +1,5 @@
-// Package fleet provides a generic, coalescing snapshot-broadcast hub shared by
-// the standalone agents' dashboard WebSocket endpoints (duplicacy-agent-api and
-// gdrive-agent).
+// Package fleet provides a generic, coalescing snapshot-broadcast hub for an
+// agent's dashboard WebSocket endpoint.
 //
 // A single broadcaster goroutine builds at most one snapshot per coalescing
 // window (driven by Trigger() calls and/or an optional periodic tick) and fans
@@ -14,10 +13,10 @@
 // stay stale for ~24h until the next job. The broadcaster NEVER unregisters a
 // subscriber itself —
 // cleanup happens exactly once, via the closure returned by Subscribe(), guarded
-// against double-close. This is the correct shape; duplicacy-agent-api's
-// hand-rolled hub previously had two unregister paths plus an unconditional
-// close, which double-closed the send channel and panicked the whole process
-// ("close of closed channel") under bursty job churn.
+// against double-close. That guard is not defensive programming: a hand-rolled
+// predecessor had two unregister paths plus an unconditional close, which
+// double-closed the send channel and panicked the whole process ("close of
+// closed channel") under bursty job churn.
 //
 // Generic over the agent-specific snapshot payload T so each agent broadcasts
 // its own shape while sharing the hub machinery.

@@ -1,8 +1,7 @@
-// Package storage is the shared on-disk toolbox for controller agents that
-// stage large files to local disk: crash-safe atomic writes, an in-band-hashed
-// streaming copy primitive, a resumable content-addressed chunk stager, plus
-// the per-account manifest / version-rotation / graveyard / path-sanitize
-// helpers promoted from gdrive-agent's internal/storage.
+// Package storage is the on-disk toolbox for agents that stage large files to
+// local disk: crash-safe atomic writes, an in-band-hashed streaming copy
+// primitive, a resumable content-addressed chunk stager, plus per-account
+// manifest / version-rotation / graveyard / path-sanitize helpers.
 //
 // Everything here is transport-neutral: no HTTP, oauth2, Drive, or Range/resume
 // semantics. Agents that need those drive the request themselves and hand the
@@ -66,11 +65,11 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 // lowercase-hex digest of exactly those bytes (no second pass over the data).
 //
 // This is the transport-neutral core of a streamed download: it has no HTTP,
-// Range, or resume semantics. Callers needing those (e.g. gdrive-agent's
+// Range, or resume semantics. Callers needing those (e.g. an agent's
 // StreamDownload) build the request themselves and pass the response body as r.
 // On any error the .part file is removed best-effort so a retry starts clean.
 // It does NOT compare the digest to an expected value — the caller does that
-// against whatever authority it has (Drive md5, catalog sha, …) and may use
+// against whatever authority it has (an upstream-provided md5, a catalog sha, …) and may use
 // ErrHashMismatch for a consistent error.
 func CopyToFileAtomic(ctx context.Context, r io.Reader, dst string, h hash.Hash) (written int64, hexsum string, err error) {
 	if r == nil || dst == "" {

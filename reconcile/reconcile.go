@@ -33,9 +33,9 @@ import (
 // time. SnapshotAt lets the controller skip rows that changed after the agent
 // built the snapshot (avoids racing an in-flight delta for a just-started job).
 type Snapshot struct {
-	Site       string           `json:"site"`
-	Node       string           `json:"node"`
-	SnapshotAt time.Time        `json:"snapshot_at"`
+	Site       string            `json:"site"`
+	Node       string            `json:"node"`
+	SnapshotAt time.Time         `json:"snapshot_at"`
 	Jobs       []jobstore.JobRef `json:"jobs"`
 }
 
@@ -45,10 +45,10 @@ type SnapshotFunc func(ctx context.Context) ([]jobstore.JobRef, error)
 
 // Config wires the reconcile loop. All fields except Interval are required.
 type Config struct {
-	Client   *http.Client // pooled, bearer + Traefik-dial transport (reuse the outbox client)
-	URL      string       // full controller endpoint, e.g. https://…/api/duplicacy/reconcile
-	Site     string       // "kd" | "ng"
-	Node     string       // short host name
+	Client   *http.Client  // pooled, bearer + Traefik-dial transport (reuse the outbox client)
+	URL      string        // full controller endpoint, e.g. https://…/api/duplicacy/reconcile
+	Site     string        // site identifier, e.g. "site-a"
+	Node     string        // short host name
 	Interval time.Duration // default 5m
 	Snapshot SnapshotFunc  // builds the declared job set from the local DB
 	Logger   *slog.Logger  // optional; defaults to slog.Default()

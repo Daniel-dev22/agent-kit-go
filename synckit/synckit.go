@@ -1,7 +1,7 @@
-// Package synckit is the Go client half of controller's bidirectional,
-// last-write-wins sync protocol. It shares the exact wire contract with the
-// server engine in controller/shared/synckit (and with the Kotlin clients
-// in android-client / mobile-client): a single POST carries both directions —
+// Package synckit is the Go client half of a bidirectional, last-write-wins
+// sync protocol. It shares an exact wire contract with the server engine and
+// with the protocol's other client implementations: a single POST carries both
+// directions —
 //
 //	request : { since: <lastServerRev>, changes: [<local dirty Records>] }
 //	response: { server_rev: <new cursor>, records: [<everything rev > since>],
@@ -76,7 +76,7 @@ type Response struct {
 }
 
 // Wins reports whether an incoming record should overwrite the current stored
-// row under last-write-wins. IDENTICAL to controller synckit.wins():
+// row under last-write-wins. IDENTICAL to the server engine's wins():
 // strictly-newer updated_at wins; on an exact updated_at tie a delete beats a
 // non-delete (a tombstone is never silently lost to a same-instant edit); any
 // other tie keeps the existing row (deterministic, no flapping).
