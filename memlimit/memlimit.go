@@ -399,7 +399,8 @@ func parseV1(s string) (int64, bool, error) {
 		return 0, false, nil
 	}
 	if u == 0 {
-		return 0, false, fmt.Errorf("invalid limit 0")
+		// Not a real limit: some runtimes report 0 for "unset".
+		return 0, false, nil
 	}
 	return int64(u), true, nil
 }

@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
@@ -36,7 +37,10 @@ func write(t *testing.T, path, content string) {
 	}
 }
 
-func derive(n int64) int64 { return int64(float64(n) * Ratio) }
+const (
+	mib = int64(1 << 20)
+	gib = int64(1 << 30)
+)
 
 // syncBuf is a goroutine-safe log sink.
 type syncBuf struct {
@@ -110,10 +114,10 @@ func TestV2OwnCgroupNumeric(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Applied || res.Source != SourceCgroupV2 || res.LimitBytes != derive(1073741824) || res.CgroupBytes != 1073741824 {
+	if !res.Applied || res.Source != SourceCgroupV2 || res.LimitBytes != 912680550 || res.CgroupBytes != 1073741824 {
 		t.Fatalf("result %+v", res)
 	}
-	if c := r.calls(); len(c) != 1 || c[0] != derive(1073741824) {
+	if c := r.calls(); len(c) != 1 || c[0] != 912680550 {
 		t.Fatalf("set %v", c)
 	}
 	if strings.Count(r.logs.String(), "\n") != 1 {
@@ -175,7 +179,7 @@ func TestV1MemoryControllerLine(t *testing.T) {
 	write(t, filepath.Join(r.root, "memory", "docker", "abc", "memory.limit_in_bytes"), "536870912\n")
 	write(t, filepath.Join(r.root, "memory", "memory.limit_in_bytes"), "9223372036854771712\n")
 	res, err := r.apply(r.opts())
-	if err != nil || !res.Applied || res.Source != SourceCgroupV1 || res.LimitBytes != derive(536870912) {
+	if err != nil || !res.Applied || res.Source != SourceCgroupV1 || res.LimitBytes != 456340275 {
 		t.Fatalf("res %+v err %v", res, err)
 	}
 }
@@ -328,7 +332,7 @@ func TestReserve(t *testing.T) {
 		{"option beats env", "1610612736", 1 << 30, max - 1<<30, false},
 		{"reserve too big floors at 50%", "", 3 << 30, max / 2, false},
 		{"reserve equals max floors at 50%", "", max, max / 2, false},
-		{"no reserve is 85%", "", 0, derive(max), false},
+		{"no reserve is 85%", "", 0, 3650722201, false},
 		{"env garbage", "lots", 0, 0, true},
 		{"env negative", "-1", 0, 0, true},
 		{"env zero", "0", 0, 0, true},
@@ -382,7 +386,7 @@ func TestRefresherReappliesOnChangeOnlyAndLogsOncePerChange(t *testing.T) {
 
 	r.cg("", "memory.max", "536870912")
 	tick <- time.Now()
-	if got := <-r.sets; got != derive(536870912) {
+	if got := <-r.sets; got != 456340275 {
 		t.Fatalf("got %d", got)
 	}
 	tick <- time.Now()
@@ -469,5 +473,90 @@ func TestAST_RefresherHonoursContext(t *testing.T) {
 	}
 	if !sawDone {
 		t.Fatal("refresh must select on ctx.Done()")
+	}
+}
+
+func TestRatioIsExactly85Percent(t *testing.T) {
+	r := newRig(t)
+	write(t, r.self, "0::/\n")
+	r.cg("", "memory.max", "1048576000\n") // 1000 MiB
+	res, err := r.apply(r.opts())
+	if err != nil || res.LimitBytes != 850*mib {
+		t.Fatalf("res %+v err %v, want exactly %d (850 MiB)", res, err, 850*mib)
+	}
+	if c := r.calls(); len(c) != 1 || c[0] != 891289600 {
+		t.Fatalf("set %v, want [891289600]", c)
+	}
+}
+
+func TestSoftLimitLiterals(t *testing.T) {
+	for _, tc := range []struct{ max, reserve, want int64 }{
+		{1000 * mib, 0, 850 * mib},
+		{4 * gib, 1536 * mib, 4*gib - 1536*mib},
+		{4 * gib, 3 * gib, 2 * gib}, // floored at exactly 50%
+		{4 * gib, 4 * gib, 2 * gib},
+		{4 * gib, 2 * gib, 2 * gib}, // reserve exactly at the floor
+		{4 * gib, 2*gib - 1, 2*gib + 1},
+	} {
+		if got := SoftLimit(tc.max, tc.reserve); got != tc.want {
+			t.Errorf("SoftLimit(%d, %d) = %d, want %d", tc.max, tc.reserve, got, tc.want)
+		}
+	}
+}
+
+// TestRealSetMemoryLimitEffect uses the real debug.SetMemoryLimit (no seam)
+// and reads the runtime's limit back.
+func TestRealSetMemoryLimitEffect(t *testing.T) {
+	prev := debug.SetMemoryLimit(-1)
+	defer debug.SetMemoryLimit(prev)
+
+	r := newRig(t)
+	write(t, r.self, "0::/\n")
+	r.cg("", "memory.max", "1048576000")
+	o := r.opts()
+	o.SetLimit = nil // use the real default
+	if _, err := r.apply(o); err != nil {
+		t.Fatal(err)
+	}
+	if got := debug.SetMemoryLimit(-1); got != 850*mib {
+		t.Fatalf("runtime limit = %d, want %d", got, 850*mib)
+	}
+}
+
+// TestRealRefresherClearsRuntimeLimit: the refresher's removal path also goes
+// through the real setter.
+func TestRealRefresherUpdatesRuntimeLimit(t *testing.T) {
+	prev := debug.SetMemoryLimit(-1)
+	defer debug.SetMemoryLimit(prev)
+
+	r := newRig(t)
+	write(t, r.self, "0::/\n")
+	r.cg("", "memory.max", "1048576000")
+	tick := make(chan time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	o := r.opts()
+	o.SetLimit, o.Interval, o.Tick = nil, 0, tick
+	if _, err := ApplyWith(ctx, slog.New(slog.NewTextHandler(r.logs, nil)), o); err != nil {
+		t.Fatal(err)
+	}
+	r.cg("", "memory.max", "2097152000") // 2000 MiB
+	tick <- time.Now()
+	tick <- time.Now() // previous tick fully processed
+	if got := debug.SetMemoryLimit(-1); got != 1700*mib {
+		t.Fatalf("runtime limit = %d, want %d", got, 1700*mib)
+	}
+}
+
+func TestV1ZeroIsNoLimit(t *testing.T) {
+	r := newRig(t)
+	write(t, r.self, "4:memory:/\n")
+	write(t, filepath.Join(r.root, "memory", "memory.limit_in_bytes"), "0\n")
+	res, err := r.apply(r.opts())
+	if err != nil || res.Applied || len(r.calls()) != 0 {
+		t.Fatalf("res %+v err %v", res, err)
+	}
+	if strings.Count(r.logs.String(), "level=WARN") != 1 {
+		t.Fatalf("want one no-limit warning, got %q", r.logs.String())
 	}
 }
