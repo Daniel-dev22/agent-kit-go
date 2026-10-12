@@ -760,3 +760,25 @@ func TestPeakAnonDefaultsDoNotPanic(t *testing.T) {
 		t.Fatalf("%+v", p)
 	}
 }
+
+func TestPeakAnonCancelOutranksReadyTick(t *testing.T) {
+	for i := 0; i < 40; i++ {
+		r := newRig(t)
+		write(t, r.self, "0::/\n")
+		r.cg("", "memory.stat", statFile(1000, 0))
+		tick := make(chan time.Time)
+		ctx, cancel := context.WithCancel(context.Background())
+		p := StartPeakAnon(ctx, slog.New(slog.NewTextHandler(r.logs, nil)),
+			PeakOptions{Root: r.root, SelfCgroup: r.self, Tick: tick})
+		cancel()
+		r.cg("", "memory.stat", statFile(9000, 0))
+		select {
+		case tick <- time.Now():
+			time.Sleep(5 * time.Millisecond)
+		case <-time.After(5 * time.Millisecond):
+		}
+		if p.Max() != 1000 {
+			t.Fatalf("iteration %d: sampled after cancel: max %d", i, p.Max())
+		}
+	}
+}
