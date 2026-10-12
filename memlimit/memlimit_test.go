@@ -59,6 +59,28 @@ func (s *syncBuf) String() string {
 	return s.b.String()
 }
 
+// sendTick delivers a tick or fails fast instead of hanging the suite.
+func sendTick(t *testing.T, tick chan time.Time) {
+	t.Helper()
+	select {
+	case tick <- time.Now():
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresher did not take the tick")
+	}
+}
+
+// nextSet waits for the next SetLimit call or fails fast.
+func (r *rig) nextSet() int64 {
+	r.t.Helper()
+	select {
+	case n := <-r.sets:
+		return n
+	case <-time.After(2 * time.Second):
+		r.t.Fatal("SetLimit was not called")
+		return 0
+	}
+}
+
 // rig is one isolated cgroup tree plus recorders.
 type rig struct {
 	t    *testing.T
@@ -376,21 +398,21 @@ func TestRefresherReappliesOnChangeOnlyAndLogsOncePerChange(t *testing.T) {
 	if _, err := ApplyWith(ctx, slog.New(slog.NewTextHandler(r.logs, nil)), o); err != nil {
 		t.Fatal(err)
 	}
-	<-r.sets // initial
+	r.nextSet() // initial
 
-	tick <- time.Now() // unchanged
-	tick <- time.Now() // guarantees the previous tick was fully processed
+	sendTick(t, tick) // unchanged
+	sendTick(t, tick) // guarantees the previous tick was fully processed
 	if c := r.calls(); len(c) != 1 {
 		t.Fatalf("unchanged limit must not re-apply: %v", c)
 	}
 
 	r.cg("", "memory.max", "536870912")
-	tick <- time.Now()
-	if got := <-r.sets; got != 456340275 {
+	sendTick(t, tick)
+	if got := r.nextSet(); got != 456340275 {
 		t.Fatalf("got %d", got)
 	}
-	tick <- time.Now()
-	tick <- time.Now()
+	sendTick(t, tick)
+	sendTick(t, tick)
 	if c := r.calls(); len(c) != 2 {
 		t.Fatalf("change must apply exactly once: %v", c)
 	}
@@ -399,15 +421,15 @@ func TestRefresherReappliesOnChangeOnlyAndLogsOncePerChange(t *testing.T) {
 	}
 
 	r.cg("", "memory.max", "max")
-	tick <- time.Now()
-	if got := <-r.sets; got != math.MaxInt64 {
+	sendTick(t, tick)
+	if got := r.nextSet(); got != math.MaxInt64 {
 		t.Fatalf("limit removal must clear, got %d", got)
 	}
 
 	r.cg("", "memory.max", "garbage")
-	tick <- time.Now()
-	tick <- time.Now()
-	tick <- time.Now()
+	sendTick(t, tick)
+	sendTick(t, tick)
+	sendTick(t, tick)
 	if n := strings.Count(r.logs.String(), "re-read failed"); n != 1 {
 		t.Fatalf("a persistent read error must log once, got %d: %s", n, r.logs.String())
 	}
@@ -417,26 +439,31 @@ func TestRefresherReappliesOnChangeOnlyAndLogsOncePerChange(t *testing.T) {
 }
 
 func TestRefresherStopsWithContext(t *testing.T) {
-	r := newRig(t)
-	write(t, r.self, "0::/\n")
-	r.cg("", "memory.max", "1073741824")
-	tick := make(chan time.Time)
-	ctx, cancel := context.WithCancel(context.Background())
-	o := r.opts()
-	o.Interval, o.Tick = 0, tick
-	if _, err := ApplyWith(ctx, slog.New(slog.NewTextHandler(r.logs, nil)), o); err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-	select {
-	case tick <- time.Now():
-		// A tick racing the cancel may still be taken once; the next must not be.
+	// With ctx cancelled AND a tick ready, a correct refresher must always
+	// pick cancellation. Select is random among ready cases, so repeat: a
+	// refresher that lets a tick outrank cancel would re-apply within a few
+	// iterations (miss probability 2^-40).
+	for i := 0; i < 40; i++ {
+		r := newRig(t)
+		write(t, r.self, "0::/\n")
+		r.cg("", "memory.max", "1073741824")
+		tick := make(chan time.Time)
+		ctx, cancel := context.WithCancel(context.Background())
+		o := r.opts()
+		o.Interval, o.Tick = 0, tick
+		if _, err := ApplyWith(ctx, slog.New(slog.NewTextHandler(r.logs, nil)), o); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		r.cg("", "memory.max", "536870912") // a re-read WOULD change the limit
 		select {
 		case tick <- time.Now():
-			t.Fatal("refresher still running after ctx cancel")
-		case <-time.After(100 * time.Millisecond):
+			time.Sleep(5 * time.Millisecond)
+		case <-time.After(5 * time.Millisecond):
 		}
-	case <-time.After(100 * time.Millisecond):
+		if c := r.calls(); len(c) != 1 {
+			t.Fatalf("iteration %d: refresher acted after ctx cancel: %v", i, c)
+		}
 	}
 }
 
@@ -541,8 +568,8 @@ func TestRealRefresherUpdatesRuntimeLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.cg("", "memory.max", "2097152000") // 2000 MiB
-	tick <- time.Now()
-	tick <- time.Now() // previous tick fully processed
+	sendTick(t, tick)
+	sendTick(t, tick) // previous tick fully processed
 	if got := debug.SetMemoryLimit(-1); got != 1700*mib {
 		t.Fatalf("runtime limit = %d, want %d", got, 1700*mib)
 	}
