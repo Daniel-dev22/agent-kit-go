@@ -676,7 +676,7 @@ func TestReadSelfAnonV1TotalRSS(t *testing.T) {
 	r := newRig(t)
 	write(t, r.self, "4:memory:/docker/abc\n")
 	write(t, filepath.Join(r.root, "memory", "docker", "abc", "memory.stat"),
-		"cache 5\nrss 100\ntotal_cache 7\ntotal_rss 4096000\ntotal_rss_huge 0\n")
+		"cache 5\nrss 100\ntotal_cache 7\ntotal_rss_huge 1\ntotal_rss 4096000\n")
 	got, err := ReadSelfAnon(r.root, r.self)
 	if err != nil || got != 4096000 {
 		t.Fatalf("got %d err %v (total_rss must not match total_rss_huge or rss)", got, err)
