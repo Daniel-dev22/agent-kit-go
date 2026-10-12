@@ -46,6 +46,12 @@ type Outbox struct {
 }
 
 // New creates the pending_events table on db (idempotent) and returns an Outbox.
+//
+// The Outbox writes from several goroutines (one push per Enqueue, plus the
+// drain loop) on the caller's *sql.DB, so a SQLite database must be opened with
+// a busy timeout (and WAL), e.g. "file:events.sqlite?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+// for modernc.org/sqlite. Without it a concurrent reader makes the writer fail
+// with SQLITE_BUSY / "disk I/O error" instead of waiting.
 // urlFor builds the POST URL from an event's job id (e.g.
 // CONTROL_CENTER_URL + "/api/duplicacy/jobs/" + id + "/event"). client should
 // already carry any auth (e.g. a bearer round-tripper).
