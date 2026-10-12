@@ -15,7 +15,8 @@ import (
 
 func newTestOutbox(t *testing.T, handler http.HandlerFunc) (*Outbox, *sql.DB) {
 	t.Helper()
-	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "events.sqlite"))
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "events.sqlite")+
+		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

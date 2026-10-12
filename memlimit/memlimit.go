@@ -80,6 +80,15 @@ const (
 	v1Unlimited = uint64(1) << 62
 )
 
+// ErrInvalidConfig marks a configuration the caller got wrong: a malformed
+// MEMLIMIT_RESERVE_BYTES or Options.ReserveBytes, or a cgroup limit too small
+// to derive a Go limit from. Test with errors.Is. Callers must treat it as
+// fatal at startup: the process would otherwise run with no soft limit under a
+// hard cgroup cap. Other errors (an unreadable or unparsable cgroup file) are
+// environmental; Apply still starts the refresher for those, which keeps
+// retrying, so they are safe to log and continue.
+var ErrInvalidConfig = errors.New("memlimit: invalid configuration")
+
 // Source says where the limit came from.
 type Source string
 
@@ -128,6 +137,10 @@ type Options struct {
 
 // Apply reads the cgroup limit, sets the Go soft memory limit and, until ctx
 // is done, keeps it in step with the cgroup. A nil logger uses slog.Default().
+//
+// An error satisfying errors.Is(err, ErrInvalidConfig) must be treated as
+// fatal by the caller: nothing was applied and no refresher runs. Any other
+// error is environmental; the refresher is running and will retry.
 func Apply(ctx context.Context, log *slog.Logger) (Result, error) {
 	return ApplyWith(ctx, log, Options{})
 }
@@ -163,11 +176,16 @@ func ApplyWith(ctx context.Context, log *slog.Logger, opts Options) (Result, err
 		return Result{}, err
 	}
 
-	res, err := resolve(opts, reserve)
-	if err != nil {
-		return Result{}, err
+	res, rerr := resolve(opts, reserve)
+	if rerr != nil && errors.Is(rerr, ErrInvalidConfig) {
+		return Result{}, rerr
 	}
 	switch {
+	case rerr != nil:
+		// Environmental (unreadable/unparsable cgroup file): no limit yet; the
+		// refresher below keeps retrying and logs the failure once.
+		res = Result{}
+		log.Warn("memlimit: could not read the cgroup limit, Go memory limit not set yet", "error", rerr)
 	case res.Source == SourceNone:
 		log.Warn("memlimit: no cgroup memory limit found, Go memory limit not set")
 	default:
@@ -177,9 +195,9 @@ func ApplyWith(ctx context.Context, log *slog.Logger, opts Options) (Result, err
 	}
 
 	if opts.Interval >= 0 {
-		go refresh(ctx, log, opts, reserve, res)
+		go refresh(ctx, log, opts, reserve, res, rerr)
 	}
-	return res, nil
+	return res, rerr
 }
 
 func logApplied(log *slog.Logger, msg string, r Result) {
@@ -198,7 +216,7 @@ func resolve(opts Options, reserve int64) (Result, error) {
 	}
 	limit := SoftLimit(max, reserve)
 	if limit < 1 {
-		return Result{}, fmt.Errorf("memlimit: cgroup limit %d too small to derive a Go limit", max)
+		return Result{}, fmt.Errorf("%w: cgroup limit %d too small to derive a Go limit", ErrInvalidConfig, max)
 	}
 	r := Result{Source: src, CgroupBytes: max, LimitBytes: limit}
 	if reserve > 0 {
@@ -230,14 +248,14 @@ func reserveBytes(opts Options) (int64, error) {
 	}
 	n, err := strconv.ParseInt(s, 10, 64)
 	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("memlimit: invalid %s %q: want a positive integer byte count", ReserveEnv, s)
+		return 0, fmt.Errorf("%w: %s %q: want a positive integer byte count", ErrInvalidConfig, ReserveEnv, s)
 	}
 	return n, nil
 }
 
 // refresh re-reads the limit until ctx is done and re-applies on change.
 // Failures and "no limit" are logged once per change of state, not per tick.
-func refresh(ctx context.Context, log *slog.Logger, opts Options, reserve int64, last Result) {
+func refresh(ctx context.Context, log *slog.Logger, opts Options, reserve int64, last Result, startErr error) {
 	tick := opts.Tick
 	if tick == nil {
 		iv := opts.Interval
@@ -249,6 +267,9 @@ func refresh(ctx context.Context, log *slog.Logger, opts Options, reserve int64,
 		tick = t.C
 	}
 	lastErr := ""
+	if startErr != nil {
+		lastErr = startErr.Error() // already logged by Apply
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -287,28 +308,8 @@ func refresh(ctx context.Context, log *slog.Logger, opts Options, reserve int64,
 // no limit anywhere on the path. If selfCgroup cannot be read it falls back
 // to the limit files directly under root.
 func ReadSelfLimit(root, selfCgroup string) (int64, Source, error) {
-	f, err := os.Open(selfCgroup)
-	if err != nil {
-		return ReadCgroupLimit(root)
-	}
-	defer f.Close()
-
-	var v2Path, v1Path string
-	var haveV2, haveV1 bool
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		parts := strings.SplitN(sc.Text(), ":", 3)
-		if len(parts) != 3 {
-			continue
-		}
-		switch {
-		case parts[0] == "0" && parts[1] == "":
-			v2Path, haveV2 = parts[2], true
-		case hasController(parts[1], "memory"):
-			v1Path, haveV1 = parts[2], true
-		}
-	}
-	if err := sc.Err(); err != nil {
+	v2Path, haveV2, v1Path, haveV1, ok := parseSelfCgroup(selfCgroup)
+	if !ok {
 		return ReadCgroupLimit(root)
 	}
 
@@ -334,6 +335,33 @@ func ReadSelfLimit(root, selfCgroup string) (int64, Source, error) {
 		return ReadCgroupLimit(root)
 	}
 	return 0, SourceNone, nil
+}
+
+// parseSelfCgroup reads a /proc/self/cgroup-format file. ok is false when the
+// file cannot be read.
+func parseSelfCgroup(selfCgroup string) (v2Path string, haveV2 bool, v1Path string, haveV1 bool, ok bool) {
+	f, err := os.Open(selfCgroup)
+	if err != nil {
+		return "", false, "", false, false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		parts := strings.SplitN(sc.Text(), ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		switch {
+		case parts[0] == "0" && parts[1] == "":
+			v2Path, haveV2 = parts[2], true
+		case hasController(parts[1], "memory"):
+			v1Path, haveV1 = parts[2], true
+		}
+	}
+	if sc.Err() != nil {
+		return "", false, "", false, false
+	}
+	return v2Path, haveV2, v1Path, haveV1, true
 }
 
 func hasController(list, name string) bool {

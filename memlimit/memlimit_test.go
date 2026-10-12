@@ -3,6 +3,7 @@ package memlimit
 import (
 	"bytes"
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -595,5 +597,166 @@ func TestV1ZeroIsNoLimit(t *testing.T) {
 	}
 	if strings.Count(r.logs.String(), "level=WARN") != 1 {
 		t.Fatalf("want one no-limit warning, got %q", r.logs.String())
+	}
+}
+
+func TestInvalidReserveIsTypedAndFatal(t *testing.T) {
+	for _, bad := range []string{"lots", "-1", "0", "1.5"} {
+		r := newRig(t)
+		write(t, r.self, "0::/\n")
+		r.cg("", "memory.max", "1073741824")
+		r.env[ReserveEnv] = bad
+		tick := make(chan time.Time)
+		o := r.opts()
+		o.Interval, o.Tick = 0, tick
+		_, err := r.apply(o)
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("%q: want ErrInvalidConfig, got %v", bad, err)
+		}
+		if len(r.calls()) != 0 {
+			t.Fatalf("%q: nothing may be applied: %v", bad, r.calls())
+		}
+		select {
+		case tick <- time.Now():
+			t.Fatalf("%q: no refresher may run after a fatal config error", bad)
+		case <-time.After(30 * time.Millisecond):
+		}
+	}
+}
+
+func TestTooSmallLimitIsInvalidConfig(t *testing.T) {
+	r := newRig(t)
+	write(t, r.self, "0::/\n")
+	r.cg("", "memory.max", "1")
+	if _, err := r.apply(r.opts()); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestEnvironmentalErrorIsNotFatalAndRefresherRecovers(t *testing.T) {
+	r := newRig(t)
+	write(t, r.self, "0::/\n")
+	r.cg("", "memory.max", "garbage")
+	tick := make(chan time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	o := r.opts()
+	o.Interval, o.Tick = 0, tick
+	_, err := ApplyWith(ctx, slog.New(slog.NewTextHandler(r.logs, nil)), o)
+	if err == nil || errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("want a non-fatal error, got %v", err)
+	}
+	r.cg("", "memory.max", "1048576000")
+	sendTick(t, tick)
+	if got := r.nextSet(); got != 850*mib {
+		t.Fatalf("refresher must adopt the limit once readable, got %d", got)
+	}
+	if n := strings.Count(r.logs.String(), "could not read the cgroup limit"); n != 1 {
+		t.Fatalf("want one start warning, got %d", n)
+	}
+}
+
+// ---- PeakAnon ----
+
+func statFile(anon, file int64) string {
+	return "anon " + strconv.FormatInt(anon, 10) + "\nfile " + strconv.FormatInt(file, 10) + "\nkernel_stack 16384\n"
+}
+
+func TestReadSelfAnonV2(t *testing.T) {
+	r := newRig(t)
+	write(t, r.self, "0::/sys/unit\n")
+	r.cg("sys/unit", "memory.stat", statFile(123456789, 999999999999))
+	got, err := ReadSelfAnon(r.root, r.self)
+	if err != nil || got != 123456789 {
+		t.Fatalf("got %d err %v", got, err)
+	}
+}
+
+func TestReadSelfAnonV1TotalRSS(t *testing.T) {
+	r := newRig(t)
+	write(t, r.self, "4:memory:/docker/abc\n")
+	write(t, filepath.Join(r.root, "memory", "docker", "abc", "memory.stat"),
+		"cache 5\nrss 100\ntotal_cache 7\ntotal_rss 4096000\ntotal_rss_huge 0\n")
+	got, err := ReadSelfAnon(r.root, r.self)
+	if err != nil || got != 4096000 {
+		t.Fatalf("got %d err %v (total_rss must not match total_rss_huge or rss)", got, err)
+	}
+}
+
+func TestReadSelfAnonFallbackAndErrors(t *testing.T) {
+	r := newRig(t) // self unreadable
+	r.cg("", "memory.stat", statFile(777, 1))
+	if got, err := ReadSelfAnon(r.root, r.self); err != nil || got != 777 {
+		t.Fatalf("fallback got %d err %v", got, err)
+	}
+	for name, content := range map[string]string{
+		"missing key": "file 1\n", "garbage": "anon lots\n", "negative": "anon -5\n"} {
+		r2 := newRig(t)
+		write(t, r2.self, "0::/\n")
+		r2.cg("", "memory.stat", content)
+		if _, err := ReadSelfAnon(r2.root, r2.self); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+	}
+	r3 := newRig(t)
+	write(t, r3.self, "0::/\n")
+	if _, err := ReadSelfAnon(r3.root, r3.self); err == nil {
+		t.Error("no memory.stat anywhere: want error")
+	}
+}
+
+func TestPeakAnonTracksMaxCurrentAndStops(t *testing.T) {
+	r := newRig(t)
+	write(t, r.self, "0::/\n")
+	r.cg("", "memory.stat", statFile(1000, 0))
+	tick := make(chan time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	p := StartPeakAnon(ctx, slog.New(slog.NewTextHandler(r.logs, nil)),
+		PeakOptions{Root: r.root, SelfCgroup: r.self, Tick: tick})
+	if s := p.Stats(); s.CurrentBytes != 1000 || s.MaxBytes != 1000 || s.Samples != 1 {
+		t.Fatalf("initial %+v", s)
+	}
+	step := func(anon int64) {
+		r.cg("", "memory.stat", statFile(anon, 0))
+		sendTick(t, tick)
+		sendTick(t, tick) // previous sample fully processed
+	}
+	step(5000)
+	step(2000) // drops: current follows, max stays
+	if s := p.Stats(); s.CurrentBytes != 2000 || s.MaxBytes != 5000 || s.Samples < 3 {
+		t.Fatalf("after rise and fall %+v", s)
+	}
+	if p.Current() != 2000 || p.Max() != 5000 {
+		t.Fatalf("accessors %d %d", p.Current(), p.Max())
+	}
+	// A failing read keeps values and logs once.
+	r.cg("", "memory.stat", "anon lots\n")
+	for i := 0; i < 4; i++ {
+		sendTick(t, tick)
+	}
+	if s := p.Stats(); s.CurrentBytes != 2000 || s.MaxBytes != 5000 {
+		t.Fatalf("failed read must keep values: %+v", s)
+	}
+	if n := strings.Count(r.logs.String(), "anon sample failed"); n != 1 {
+		t.Fatalf("want one failure log, got %d", n)
+	}
+	cancel()
+	r.cg("", "memory.stat", statFile(9000, 0))
+	select {
+	case tick <- time.Now():
+		time.Sleep(5 * time.Millisecond)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if p.Max() != 5000 {
+		t.Fatalf("sampler ran after ctx cancel: max %d", p.Max())
+	}
+}
+
+func TestPeakAnonDefaultsDoNotPanic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := StartPeakAnon(ctx, nil, PeakOptions{Root: t.TempDir(), SelfCgroup: filepath.Join(t.TempDir(), "nope")})
+	if p == nil || p.Max() != 0 {
+		t.Fatalf("%+v", p)
 	}
 }
