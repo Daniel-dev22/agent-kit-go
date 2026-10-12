@@ -334,9 +334,19 @@ func TestPathTraversalInSelfCgroupStaysUnderRoot(t *testing.T) {
 	r := newRig(t)
 	write(t, r.self, "0::/../../escape\n")
 	write(t, filepath.Join(filepath.Dir(r.root), "memory.max"), "1024") // outside root
+	write(t, filepath.Join(filepath.Dir(filepath.Dir(r.root)), "escape", "memory.max"), "2048")
 	res, err := r.apply(r.opts())
 	if err != nil || res.Applied {
 		t.Fatalf("must not read outside root: res %+v err %v", res, err)
+	}
+
+	// A path without the leading slash must be confined too.
+	r2 := newRig(t)
+	write(t, r2.self, "0::../../escape\n")
+	write(t, filepath.Join(filepath.Dir(filepath.Dir(r2.root)), "escape", "memory.max"), "2048")
+	res, err = r2.apply(r2.opts())
+	if err != nil || res.Applied {
+		t.Fatalf("relative path escaped root: res %+v err %v", res, err)
 	}
 }
 
