@@ -14,8 +14,11 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -53,9 +56,9 @@ type bearerRoundTripper struct {
 // "Authorization: Bearer <token>" on every request whose Authorization header
 // is empty, then delegates to base. A caller-set Authorization header is never
 // overwritten (so per-request overrides still work). If base is nil,
-// http.DefaultTransport is used. The token is never sent on a redirect hop that
-// changes host:port or downgrades https to http (credentials do not follow
-// redirects to a different origin).
+// http.DefaultTransport is used. A redirect hop that leaves the original request's
+// origin (host:port) or downgrades https to http is refused with
+// ErrCrossOriginRedirect: neither the token nor the body follows it.
 func NewBearerRoundTripper(base http.RoundTripper, token string) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
@@ -64,17 +67,12 @@ func NewBearerRoundTripper(base http.RoundTripper, token string) http.RoundTripp
 }
 
 func (b *bearerRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
-	if !sameOrigin(r) {
-		// A redirect hop to another origin: net/http strips a caller-set
-		// Authorization on cross-host hops, but only before this RoundTripper
-		// runs, so attaching the token here would hand it to the redirect
-		// target. Send the hop with no credential at all.
-		if r.Header.Get("Authorization") == "" {
-			return b.base.RoundTrip(r)
+	if err := checkRedirectChain(r); err != nil {
+		// RoundTrip must always close the request body, including on error.
+		if r.Body != nil {
+			_ = r.Body.Close()
 		}
-		r2 := r.Clone(r.Context())
-		r2.Header.Del("Authorization")
-		return b.base.RoundTrip(r2)
+		return nil, err
 	}
 	if b.token != "" && r.Header.Get("Authorization") == "" {
 		// Clone before mutating per the net/http RoundTripper contract.
@@ -85,18 +83,59 @@ func (b *bearerRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) 
 	return b.base.RoundTrip(r)
 }
 
-// sameOrigin reports whether r may carry the credential: true for an original
-// request, and for a redirect hop only when it stays on the same host:port and
-// does not downgrade https to http. net/http sets r.Response on redirect hops.
-func sameOrigin(r *http.Request) bool {
-	if r.Response == nil || r.Response.Request == nil || r.Response.Request.URL == nil {
-		return true
+// ErrCrossOriginRedirect is returned (wrapped in *url.Error by http.Client)
+// when a redirect hop would leave the origin of the ORIGINAL request or
+// downgrade https to http. Agents only ever call their controller; a redirect
+// elsewhere is a misconfiguration or a compromise, and following it would hand
+// the credential and (for 307/308) the replayed request body to that host.
+var ErrCrossOriginRedirect = errors.New("transport: refusing cross-origin or scheme-downgrading redirect")
+
+// checkRedirectChain refuses a redirect hop that left the root request's
+// origin. net/http sets r.Response on every redirect hop, and resp.Request is
+// the PREVIOUS hop, so the chain is walked to the root and every hop compared
+// against it (never against its predecessor: A -> B -> B must not look
+// same-origin). Sticky by construction, like net/http's own header stripping.
+func checkRedirectChain(r *http.Request) error {
+	if r.Response == nil {
+		return nil
 	}
-	from := r.Response.Request.URL
-	if from.Scheme == "https" && r.URL.Scheme != "https" {
-		return false
+	root := r
+	for root.Response != nil && root.Response.Request != nil {
+		root = root.Response.Request
 	}
-	return from.Host == r.URL.Host
+	if root == r || root.URL == nil {
+		return nil
+	}
+	rootOrigin := originOf(root.URL)
+	for h := r; h != nil && h != root; {
+		if h.URL == nil || originOf(h.URL) != rootOrigin ||
+			(root.URL.Scheme == "https" && h.URL.Scheme != "https") {
+			return ErrCrossOriginRedirect
+		}
+		if h.Response == nil {
+			break
+		}
+		h = h.Response.Request
+	}
+	return nil
+}
+
+// originOf canonicalises scheme://host:port (lower-case, no trailing dot,
+// default port made explicit) so equivalent spellings of one origin compare
+// equal. Anything else compares unequal, which fails closed.
+func originOf(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		}
+	}
+	return scheme + "://" + net.JoinHostPort(host, port)
 }
 
 // NewRouterTransport builds a pooled *http.Transport with the canonical pool
