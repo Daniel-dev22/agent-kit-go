@@ -62,17 +62,31 @@ type Conflict struct {
 
 // Request is the sync POST body: the client's last server cursor plus its
 // locally-dirty records to push.
+//
+// Limit (omitted when 0) asks the server to page: it returns the Limit
+// lowest-rev records with rev > Since and sets Response.More. Zero keeps the
+// legacy unbounded behaviour, so clients that never set it are unchanged.
 type Request struct {
 	Since   int64    `json:"since"`
 	Changes []Record `json:"changes"`
+	Limit   int      `json:"limit,omitempty"`
 }
 
 // Response is the sync POST result: the new server cursor, every row with
 // rev > since, and any pushed changes that lost LWW.
+//
+// Paging fields are omitted by servers that do not page. With More set,
+// ServerRev is the last rev returned (not the high-water) and the client
+// re-POSTs with Since=ServerRev. ResyncRequired means Since fell below
+// MinRetainedRev (tombstones swept): the client discards its mirror and pulls
+// from Since=0; no Records are returned.
 type Response struct {
-	ServerRev int64      `json:"server_rev"`
-	Records   []Record   `json:"records"`
-	Conflicts []Conflict `json:"conflicts"`
+	ServerRev      int64      `json:"server_rev"`
+	Records        []Record   `json:"records"`
+	Conflicts      []Conflict `json:"conflicts"`
+	More           bool       `json:"more,omitempty"`
+	ResyncRequired bool       `json:"resync_required,omitempty"`
+	MinRetainedRev int64      `json:"min_retained_rev,omitempty"`
 }
 
 // Wins reports whether an incoming record should overwrite the current stored
