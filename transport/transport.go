@@ -53,7 +53,9 @@ type bearerRoundTripper struct {
 // "Authorization: Bearer <token>" on every request whose Authorization header
 // is empty, then delegates to base. A caller-set Authorization header is never
 // overwritten (so per-request overrides still work). If base is nil,
-// http.DefaultTransport is used.
+// http.DefaultTransport is used. The token is never sent on a redirect hop that
+// changes host:port or downgrades https to http (credentials do not follow
+// redirects to a different origin).
 func NewBearerRoundTripper(base http.RoundTripper, token string) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
@@ -62,6 +64,18 @@ func NewBearerRoundTripper(base http.RoundTripper, token string) http.RoundTripp
 }
 
 func (b *bearerRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	if !sameOrigin(r) {
+		// A redirect hop to another origin: net/http strips a caller-set
+		// Authorization on cross-host hops, but only before this RoundTripper
+		// runs, so attaching the token here would hand it to the redirect
+		// target. Send the hop with no credential at all.
+		if r.Header.Get("Authorization") == "" {
+			return b.base.RoundTrip(r)
+		}
+		r2 := r.Clone(r.Context())
+		r2.Header.Del("Authorization")
+		return b.base.RoundTrip(r2)
+	}
 	if b.token != "" && r.Header.Get("Authorization") == "" {
 		// Clone before mutating per the net/http RoundTripper contract.
 		r2 := r.Clone(r.Context())
@@ -69,6 +83,20 @@ func (b *bearerRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) 
 		return b.base.RoundTrip(r2)
 	}
 	return b.base.RoundTrip(r)
+}
+
+// sameOrigin reports whether r may carry the credential: true for an original
+// request, and for a redirect hop only when it stays on the same host:port and
+// does not downgrade https to http. net/http sets r.Response on redirect hops.
+func sameOrigin(r *http.Request) bool {
+	if r.Response == nil || r.Response.Request == nil || r.Response.Request.URL == nil {
+		return true
+	}
+	from := r.Response.Request.URL
+	if from.Scheme == "https" && r.URL.Scheme != "https" {
+		return false
+	}
+	return from.Host == r.URL.Host
 }
 
 // NewRouterTransport builds a pooled *http.Transport with the canonical pool
