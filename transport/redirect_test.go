@@ -178,6 +178,11 @@ func TestRedirectChainOriginRules(t *testing.T) {
 		{"host case", []string{"https://H.Example/x", "https://h.example/y"}, true},
 		{"trailing dot", []string{"https://h.example./x", "https://h.example/y"}, true},
 		{"ipv6", []string{"https://[::1]:8443/x", "https://[::1]:8443/y"}, true},
+		{"ipv6 different address", []string{"https://[::1]:8443/x", "https://[::2]:8443/y"}, false},
+		{"ipv6 different port", []string{"https://[::1]:8443/x", "https://[::1]:9443/y"}, false},
+		{"ipv6 vs ipv4 loopback", []string{"https://[::1]:8443/x", "https://127.0.0.1:8443/y"}, false},
+		{"userinfo is not origin", []string{"https://h.example/x", "https://u:p@h.example/y"}, true},
+		{"userinfo cannot disguise host", []string{"https://h.example/x", "https://h.example@evil.example/y"}, false},
 	} {
 		cap := &captureRT{}
 		_, err := NewBearerRoundTripper(cap, "s3cret").RoundTrip(chain(t, tc.urls...))
@@ -190,6 +195,63 @@ func TestRedirectChainOriginRules(t *testing.T) {
 		if !errors.Is(err, ErrCrossOriginRedirect) || cap.got != nil {
 			t.Errorf("%s: err=%v forwarded=%v, want refused and not forwarded", tc.name, err, cap.got != nil)
 		}
+	}
+}
+
+// A client built with NO token must refuse too: it would otherwise follow the
+// redirect and the caller would accept the foreign body as the controller's.
+func TestTokenlessRouterClientRefusesCrossOriginRedirect(t *testing.T) {
+	target := newRecorder(t, nil)
+	origin := newRecorder(t, redirectTo(localhostURL(target.URL)))
+	c := NewRouterClient(RouterClientConfig{})
+	resp, err := c.Post(origin.URL, "text/plain", strings.NewReader("SECRET-BODY"))
+	if err == nil {
+		resp.Body.Close()
+	}
+	assertRefused(t, err)
+	assertUntouched(t, "target", target)
+}
+
+func TestTokenlessRouterClientChainsAndSameOrigin(t *testing.T) {
+	b := newRecorder(t, redirectTo("/y"))
+	a := newRecorder(t, redirectTo(localhostURL(b.URL)+"/x"))
+	c := NewRouterClient(RouterClientConfig{})
+	resp, err := c.Get(a.URL)
+	if err == nil {
+		resp.Body.Close()
+	}
+	assertRefused(t, err)
+	assertUntouched(t, "B", b)
+
+	srv := newRecorder(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/a" {
+			http.Redirect(w, r, "/b", http.StatusTemporaryRedirect)
+		}
+	})
+	resp, err = c.Post(srv.URL+"/a", "text/plain", strings.NewReader("SECRET-BODY"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if srv.hits() != 2 || srv.body[1] != "SECRET-BODY" {
+		t.Fatalf("same-origin tokenless redirect: hits=%d bodies=%q", srv.hits(), srv.body)
+	}
+}
+
+func TestRefuseCrossOriginRedirectLimitAndRules(t *testing.T) {
+	root, _ := http.NewRequest(http.MethodGet, "https://h.example/x", nil)
+	next, _ := http.NewRequest(http.MethodGet, "https://h.example:443/y", nil)
+	if err := refuseCrossOriginRedirect(next, []*http.Request{root}); err != nil {
+		t.Fatalf("same origin refused: %v", err)
+	}
+	other, _ := http.NewRequest(http.MethodGet, "http://h.example/y", nil)
+	assertRefused(t, refuseCrossOriginRedirect(other, []*http.Request{root}))
+	via := make([]*http.Request, maxRedirects)
+	for i := range via {
+		via[i] = root
+	}
+	if err := refuseCrossOriginRedirect(next, via); err == nil {
+		t.Fatal("redirect limit not enforced")
 	}
 }
 

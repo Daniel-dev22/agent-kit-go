@@ -106,16 +106,43 @@ func checkRedirectChain(r *http.Request) error {
 	if root == r || root.URL == nil {
 		return nil
 	}
-	rootOrigin := originOf(root.URL)
 	for h := r; h != nil && h != root; {
-		if h.URL == nil || originOf(h.URL) != rootOrigin ||
-			(root.URL.Scheme == "https" && h.URL.Scheme != "https") {
+		if h.URL == nil || leavesOrigin(root.URL, h.URL) {
 			return ErrCrossOriginRedirect
 		}
 		if h.Response == nil {
 			break
 		}
 		h = h.Response.Request
+	}
+	return nil
+}
+
+// leavesOrigin reports whether next is a different origin from root or drops
+// below an https root. The single rule shared by the RoundTripper check and
+// the client CheckRedirect.
+func leavesOrigin(root, next *url.URL) bool {
+	return originOf(next) != originOf(root) ||
+		(strings.EqualFold(root.Scheme, "https") && !strings.EqualFold(next.Scheme, "https"))
+}
+
+// maxRedirects mirrors net/http's default limit, which a custom CheckRedirect
+// replaces.
+const maxRedirects = 10
+
+// refuseCrossOriginRedirect is the http.Client.CheckRedirect for every kit
+// client, token or not: a tokenless client would otherwise follow a redirect to
+// another origin and accept the foreign response as the controller's answer
+// (e.g. secrets vend). via[0] is the original request.
+func refuseCrossOriginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	if len(via) >= maxRedirects {
+		return errors.New("stopped after 10 redirects")
+	}
+	if via[0].URL == nil || req.URL == nil || leavesOrigin(via[0].URL, req.URL) {
+		return ErrCrossOriginRedirect
 	}
 	return nil
 }
@@ -189,15 +216,18 @@ type RouterClientConfig struct {
 
 // NewRouterClient composes NewRouterTransport with the canonical client
 // timeout and, when cfg.BearerToken is set, an outer NewBearerRoundTripper.
-// The returned client is safe for concurrent use and should be process-global
-// (its transport owns the connection pool).
+// Whatever the token, the client refuses any redirect that leaves the original
+// request's origin (ErrCrossOriginRedirect). The returned client is safe for
+// concurrent use and should be process-global (its transport owns the
+// connection pool).
 func NewRouterClient(cfg RouterClientConfig) *http.Client {
 	var rt http.RoundTripper = NewRouterTransport(cfg.TraefikDockerDNS, cfg.TraefikDialPort)
 	if cfg.BearerToken != "" {
 		rt = NewBearerRoundTripper(rt, cfg.BearerToken)
 	}
 	return &http.Client{
-		Timeout:   clientTimeout,
-		Transport: rt,
+		Timeout:       clientTimeout,
+		Transport:     rt,
+		CheckRedirect: refuseCrossOriginRedirect,
 	}
 }
