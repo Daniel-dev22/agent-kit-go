@@ -60,19 +60,47 @@ type Conflict struct {
 	ServerUpdatedAt time.Time `json:"server_updated_at"`
 }
 
+// Deduped reports a pushed record the server dropped because its (repo,
+// content_hash) matched a live row under another id. It is keyed on the
+// CLIENT's id. Mirror rule: tombstone the local ID locally (never pushed) and
+// adopt the server row Of.
+type Deduped struct {
+	ID     string  `json:"id"`
+	Status string  `json:"status"`
+	Of     string  `json:"of"`
+	Score  float64 `json:"score"`
+}
+
 // Request is the sync POST body: the client's last server cursor plus its
 // locally-dirty records to push.
+//
+// Limit (omitted when 0) asks the server to page: it returns the Limit
+// lowest-rev records with rev > Since and sets Response.More. Zero keeps the
+// legacy unbounded behaviour, so clients that never set it are unchanged.
 type Request struct {
 	Since   int64    `json:"since"`
 	Changes []Record `json:"changes"`
+	Limit   int      `json:"limit,omitempty"`
 }
 
 // Response is the sync POST result: the new server cursor, every row with
 // rev > since, and any pushed changes that lost LWW.
+//
+// Paging fields are omitted by servers that do not page. With More set,
+// ServerRev is the last rev returned (not the high-water) and the client
+// re-POSTs with Since=ServerRev. ResyncRequired means Since fell below
+// MinRetainedRev (tombstones swept) and the server REFUSED the whole call:
+// nothing was applied, no Records are returned. The client discards its CLEAN
+// mirror rows only (never queued, unpushed writes), resets its cursor to 0 and
+// re-sends the same changes on the Since=0 call.
 type Response struct {
-	ServerRev int64      `json:"server_rev"`
-	Records   []Record   `json:"records"`
-	Conflicts []Conflict `json:"conflicts"`
+	ServerRev      int64      `json:"server_rev"`
+	Records        []Record   `json:"records"`
+	Conflicts      []Conflict `json:"conflicts,omitempty"`
+	Deduped        []Deduped  `json:"deduped,omitempty"`
+	More           bool       `json:"more,omitempty"`
+	ResyncRequired bool       `json:"resync_required,omitempty"`
+	MinRetainedRev int64      `json:"min_retained_rev,omitempty"`
 }
 
 // Wins reports whether an incoming record should overwrite the current stored
