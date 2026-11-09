@@ -16,10 +16,13 @@ import (
 // included.
 //
 // To update it: copy the canonical file over testdata_sync_golden.json, set
-// goldenSHA256 to `sha256sum` of it, extend wantCases. The release gate runs
-// with KIT_GOLDEN_CANONICAL=/docker_container_volumes/agent-skills/docs/memory_api_sync_golden.json
-// which makes TestGoldenMatchesCanonical byte-compare against the live file, so
-// a canonical change cannot leave this suite green on a stale copy.
+// goldenSHA256 to `sha256sum` of it, extend wantCases, in ONE change.
+// goldenSHA256 is the gate: it is the same value pinned in the contract doc
+// (agent-skills docs/memory_api_CONTRACT.md) and in memory-api's twin test, so
+// all three move together or a suite fails. CI has no agent-skills checkout;
+// TestGoldenMatchesCanonical is a local-only extra: set KIT_GOLDEN_CANONICAL to
+// /docker_container_volumes/agent-skills/docs/memory_api_sync_golden.json to
+// byte-compare the copy with the live file.
 const goldenSHA256 = "03f65739db2a10176e2008d9d1bfd675a46e6e118ca409a4f684c63180d0bbde"
 
 var wantCases = []string{"push_and_first_page", "last_page_no_changes", "dedup_on_push", "conflict_on_push", "more_with_deduped", "resync_required"}
@@ -67,7 +70,7 @@ func TestGoldenPinnedHash(t *testing.T) {
 func TestGoldenMatchesCanonical(t *testing.T) {
 	path := os.Getenv("KIT_GOLDEN_CANONICAL")
 	if path == "" {
-		t.Skip("set KIT_GOLDEN_CANONICAL to byte-compare against the canonical fixture (release gate)")
+		t.Skip("local-only: set KIT_GOLDEN_CANONICAL to byte-compare against the canonical fixture")
 	}
 	canon, err := os.ReadFile(path)
 	if err != nil {

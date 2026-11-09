@@ -43,12 +43,20 @@ func TestOldWireRequestBytesUnchangedWhenPagingUnused(t *testing.T) {
 
 func TestNewKitDecodesOldResponsesWithIdenticalBehaviour(t *testing.T) {
 	conflict := []Conflict{{Kind: "file", ID: "f1", DeviceUpdatedAt: compatAt, ServerUpdatedAt: compatAt.Add(time.Hour)}}
-	for name, old := range map[string]oldResponse{
-		"conflicts null":  {ServerRev: 9, Records: []Record{compatRecord()}},
-		"conflicts empty": {ServerRev: 9, Records: []Record{compatRecord()}, Conflicts: []Conflict{}},
-		"conflicts set":   {ServerRev: 9, Records: []Record{compatRecord()}, Conflicts: conflict},
-		"no records":      {ServerRev: 3, Records: []Record{}},
+	type tc struct {
+		old   oldResponse
+		since int64
+	}
+	for name, c := range map[string]tc{
+		"conflicts null":      {oldResponse{ServerRev: 9, Records: []Record{compatRecord()}}, 2},
+		"conflicts empty":     {oldResponse{ServerRev: 9, Records: []Record{compatRecord()}, Conflicts: []Conflict{}}, 2},
+		"conflicts set":       {oldResponse{ServerRev: 9, Records: []Record{compatRecord()}, Conflicts: conflict}, 2},
+		"no records":          {oldResponse{ServerRev: 3, Records: []Record{}}, 2},
+		"idle: rev == since":  {oldResponse{ServerRev: 2, Records: nil}, 2},
+		"first pull: since 0": {oldResponse{ServerRev: 9, Records: []Record{compatRecord()}}, 0},
+		"empty server":        {oldResponse{ServerRev: 0, Records: []Record{}}, 0},
 	} {
+		old, since := c.old, c.since
 		t.Run(name, func(t *testing.T) {
 			raw, _ := json.Marshal(old)
 			var got Response
@@ -66,7 +74,7 @@ func TestNewKitDecodesOldResponsesWithIdenticalBehaviour(t *testing.T) {
 			// Behaviour through the paged path: an old server's answer is one final page.
 			calls := 0
 			pull := func(context.Context, Request) (Response, error) { return got, nil }
-			rev, err := PullPaged(context.Background(), pull, 2, nil, 0, func(Response) error { calls++; return nil })
+			rev, err := PullPaged(context.Background(), pull, since, nil, 0, func(Response) error { calls++; return nil })
 			if err != nil || rev != old.ServerRev || calls != 1 {
 				t.Fatalf("rev=%d calls=%d err=%v", rev, calls, err)
 			}

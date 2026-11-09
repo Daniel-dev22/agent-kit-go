@@ -89,8 +89,10 @@ type Request struct {
 // Paging fields are omitted by servers that do not page. With More set,
 // ServerRev is the last rev returned (not the high-water) and the client
 // re-POSTs with Since=ServerRev. ResyncRequired means Since fell below
-// MinRetainedRev (tombstones swept): the client discards its mirror and pulls
-// from Since=0; no Records are returned.
+// MinRetainedRev (tombstones swept) and the server REFUSED the whole call:
+// nothing was applied, no Records are returned. The client discards its CLEAN
+// mirror rows only (never queued, unpushed writes), resets its cursor to 0 and
+// re-sends the same changes on the Since=0 call.
 type Response struct {
 	ServerRev      int64      `json:"server_rev"`
 	Records        []Record   `json:"records"`

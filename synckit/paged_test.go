@@ -119,6 +119,9 @@ func TestPullPagedRejectsBadPagesBeforeApply(t *testing.T) {
 		"more, rev != last":    {ServerRev: 900, More: true, Records: []Record{{ID: "a", Rev: 600}}},
 		"final but regressed":  {ServerRev: 200},
 		"final regressed+recs": {ServerRev: 499, Records: []Record{{ID: "a", Rev: 499}}},
+		"record <= since":      {ServerRev: 600, Records: []Record{{ID: "a", Rev: 500}}},
+		"record > server_rev":  {ServerRev: 600, Records: []Record{{ID: "a", Rev: 601}}},
+		"paged out of order":   {ServerRev: 700, More: true, Records: []Record{{ID: "a", Rev: 650}, {ID: "b", Rev: 600}, {ID: "c", Rev: 700}}},
 	}
 	for name, resp := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -74,6 +74,20 @@ func PullPaged(ctx context.Context, pull PullFunc, since int64, changes []Record
 }
 
 func validatePage(since int64, resp Response) error {
+	// Every returned record must lie in (since, ServerRev]: the cursor is bounded
+	// by ServerRev, so a record outside that window would be lost or re-read.
+	prev := since
+	for _, r := range resp.Records {
+		if r.Rev <= since || r.Rev > resp.ServerRev {
+			return fmt.Errorf("%w: record %s rev %d outside (%d, %d]", ErrProtocol, r.ID, r.Rev, since, resp.ServerRev)
+		}
+		// Paged pages are returned lowest-rev first; a legacy unbounded answer
+		// makes no ordering promise, so order is only enforced when paging.
+		if resp.More && r.Rev <= prev {
+			return fmt.Errorf("%w: paged records not in ascending rev order at %s", ErrProtocol, r.ID)
+		}
+		prev = r.Rev
+	}
 	if resp.More {
 		if resp.ServerRev <= since {
 			return fmt.Errorf("%w: more=true but server_rev %d did not advance past since %d", ErrProtocol, resp.ServerRev, since)
