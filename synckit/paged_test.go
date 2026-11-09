@@ -90,7 +90,7 @@ func TestLegacyWireOmitsPagingFields(t *testing.T) {
 		t.Fatalf("legacy request changed: %s", b)
 	}
 	b, _ = json.Marshal(Response{ServerRev: 2})
-	if string(b) != `{"server_rev":2,"records":null,"conflicts":null}` {
+	if string(b) != `{"server_rev":2,"records":null}` {
 		t.Fatalf("legacy response changed: %s", b)
 	}
 }

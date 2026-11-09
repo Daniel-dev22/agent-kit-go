@@ -60,6 +60,17 @@ type Conflict struct {
 	ServerUpdatedAt time.Time `json:"server_updated_at"`
 }
 
+// Deduped reports a pushed record the server dropped because its (repo,
+// content_hash) matched a live row under another id. It is keyed on the
+// CLIENT's id. Mirror rule: tombstone the local ID locally (never pushed) and
+// adopt the server row Of.
+type Deduped struct {
+	ID     string  `json:"id"`
+	Status string  `json:"status"`
+	Of     string  `json:"of"`
+	Score  float64 `json:"score"`
+}
+
 // Request is the sync POST body: the client's last server cursor plus its
 // locally-dirty records to push.
 //
@@ -83,7 +94,8 @@ type Request struct {
 type Response struct {
 	ServerRev      int64      `json:"server_rev"`
 	Records        []Record   `json:"records"`
-	Conflicts      []Conflict `json:"conflicts"`
+	Conflicts      []Conflict `json:"conflicts,omitempty"`
+	Deduped        []Deduped  `json:"deduped,omitempty"`
 	More           bool       `json:"more,omitempty"`
 	ResyncRequired bool       `json:"resync_required,omitempty"`
 	MinRetainedRev int64      `json:"min_retained_rev,omitempty"`

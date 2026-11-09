@@ -1,0 +1,65 @@
+{
+  "_comment": "Golden wire fixture for POST /v1/sync. Every consumer (memory-api, agent-kit-go synckit client) must decode request/response into its typed structs and re-encode to JSON-equal output. Omitted keys are omitted by the server (omitempty); that is part of the contract.",
+  "cases": [
+    {
+      "name": "push_and_first_page",
+      "request": {
+        "since": 0,
+        "limit": 2,
+        "changes": [
+          {
+            "kind": "memory",
+            "id": "11111111-1111-4111-8111-111111111111",
+            "rev": 0,
+            "updated_at": "2026-11-09T10:00:00Z",
+            "deleted": false,
+            "fields": {"repo": "control-center", "type": "decision", "title": "Use Recreate", "body": "role limit 2", "tags": ["pg"], "supersedes": null}
+          }
+        ]
+      },
+      "response": {
+        "server_rev": 8,
+        "more": true,
+        "records": [
+          {"kind": "memory", "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "rev": 7, "updated_at": "2026-11-08T09:00:00Z", "deleted": false, "updated_by": "dev1",
+           "fields": {"repo": "control-center", "type": "note", "title": "A", "body": "a", "tags": [], "content_hash": "h-a", "supersedes": null}},
+          {"kind": "memory", "id": "11111111-1111-4111-8111-111111111111", "rev": 8, "updated_at": "2026-11-09T10:00:00Z", "deleted": false, "updated_by": "dev1",
+           "fields": {"repo": "control-center", "type": "decision", "title": "Use Recreate", "body": "role limit 2", "tags": ["pg"], "content_hash": "h-1", "supersedes": null}}
+        ]
+      }
+    },
+    {
+      "name": "last_page_no_changes",
+      "request": {"since": 8, "limit": 2, "changes": []},
+      "response": {
+        "server_rev": 9,
+        "records": [
+          {"kind": "memory", "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "rev": 9, "updated_at": "2026-11-09T11:00:00Z", "deleted": true, "updated_by": "dev2"}
+        ]
+      }
+    },
+    {
+      "name": "dedup_on_push",
+      "request": {
+        "since": 9,
+        "limit": 2,
+        "changes": [
+          {"kind": "memory", "id": "22222222-2222-4222-8222-222222222222", "rev": 0, "updated_at": "2026-11-09T12:00:00Z", "deleted": false,
+           "fields": {"repo": "control-center", "type": "decision", "title": "Use Recreate", "body": "role limit 2", "tags": ["pg"], "supersedes": null}}
+        ]
+      },
+      "response": {
+        "server_rev": 9,
+        "records": [],
+        "deduped": [
+          {"id": "22222222-2222-4222-8222-222222222222", "status": "duplicate", "of": "11111111-1111-4111-8111-111111111111", "score": 1}
+        ]
+      }
+    },
+    {
+      "name": "resync_required",
+      "request": {"since": 3, "limit": 2, "changes": []},
+      "response": {"server_rev": 3, "records": [], "resync_required": true, "min_retained_rev": 7}
+    }
+  ]
+}
