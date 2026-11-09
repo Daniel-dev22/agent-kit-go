@@ -14,8 +14,11 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -53,7 +56,9 @@ type bearerRoundTripper struct {
 // "Authorization: Bearer <token>" on every request whose Authorization header
 // is empty, then delegates to base. A caller-set Authorization header is never
 // overwritten (so per-request overrides still work). If base is nil,
-// http.DefaultTransport is used.
+// http.DefaultTransport is used. A redirect hop that leaves the original request's
+// origin (host:port) or downgrades https to http is refused with
+// ErrCrossOriginRedirect: neither the token nor the body follows it.
 func NewBearerRoundTripper(base http.RoundTripper, token string) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
@@ -62,6 +67,13 @@ func NewBearerRoundTripper(base http.RoundTripper, token string) http.RoundTripp
 }
 
 func (b *bearerRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	if err := checkRedirectChain(r); err != nil {
+		// RoundTrip must always close the request body, including on error.
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+		return nil, err
+	}
 	if b.token != "" && r.Header.Get("Authorization") == "" {
 		// Clone before mutating per the net/http RoundTripper contract.
 		r2 := r.Clone(r.Context())
@@ -69,6 +81,88 @@ func (b *bearerRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) 
 		return b.base.RoundTrip(r2)
 	}
 	return b.base.RoundTrip(r)
+}
+
+// ErrCrossOriginRedirect is returned (wrapped in *url.Error by http.Client)
+// when a redirect hop would leave the origin of the ORIGINAL request or
+// downgrade https to http. Agents only ever call their controller; a redirect
+// elsewhere is a misconfiguration or a compromise, and following it would hand
+// the credential and (for 307/308) the replayed request body to that host.
+var ErrCrossOriginRedirect = errors.New("transport: refusing cross-origin or scheme-downgrading redirect")
+
+// checkRedirectChain refuses a redirect hop that left the root request's
+// origin. net/http sets r.Response on every redirect hop, and resp.Request is
+// the PREVIOUS hop, so the chain is walked to the root and every hop compared
+// against it (never against its predecessor: A -> B -> B must not look
+// same-origin). Sticky by construction, like net/http's own header stripping.
+func checkRedirectChain(r *http.Request) error {
+	if r.Response == nil {
+		return nil
+	}
+	root := r
+	for root.Response != nil && root.Response.Request != nil {
+		root = root.Response.Request
+	}
+	if root == r || root.URL == nil {
+		return nil
+	}
+	for h := r; h != nil && h != root; {
+		if h.URL == nil || leavesOrigin(root.URL, h.URL) {
+			return ErrCrossOriginRedirect
+		}
+		if h.Response == nil {
+			break
+		}
+		h = h.Response.Request
+	}
+	return nil
+}
+
+// leavesOrigin reports whether next is a different origin from root or drops
+// below an https root. The single rule shared by the RoundTripper check and
+// the client CheckRedirect.
+func leavesOrigin(root, next *url.URL) bool {
+	return originOf(next) != originOf(root) ||
+		(strings.EqualFold(root.Scheme, "https") && !strings.EqualFold(next.Scheme, "https"))
+}
+
+// maxRedirects mirrors net/http's default limit, which a custom CheckRedirect
+// replaces.
+const maxRedirects = 10
+
+// refuseCrossOriginRedirect is the http.Client.CheckRedirect for every kit
+// client, token or not: a tokenless client would otherwise follow a redirect to
+// another origin and accept the foreign response as the controller's answer
+// (e.g. secrets vend). via[0] is the original request.
+func refuseCrossOriginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	if len(via) >= maxRedirects {
+		return errors.New("stopped after 10 redirects")
+	}
+	if via[0].URL == nil || req.URL == nil || leavesOrigin(via[0].URL, req.URL) {
+		return ErrCrossOriginRedirect
+	}
+	return nil
+}
+
+// originOf canonicalises scheme://host:port (lower-case, no trailing dot,
+// default port made explicit) so equivalent spellings of one origin compare
+// equal. Anything else compares unequal, which fails closed.
+func originOf(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		}
+	}
+	return scheme + "://" + net.JoinHostPort(host, port)
 }
 
 // NewRouterTransport builds a pooled *http.Transport with the canonical pool
@@ -122,15 +216,18 @@ type RouterClientConfig struct {
 
 // NewRouterClient composes NewRouterTransport with the canonical client
 // timeout and, when cfg.BearerToken is set, an outer NewBearerRoundTripper.
-// The returned client is safe for concurrent use and should be process-global
-// (its transport owns the connection pool).
+// Whatever the token, the client refuses any redirect that leaves the original
+// request's origin (ErrCrossOriginRedirect). The returned client is safe for
+// concurrent use and should be process-global (its transport owns the
+// connection pool).
 func NewRouterClient(cfg RouterClientConfig) *http.Client {
 	var rt http.RoundTripper = NewRouterTransport(cfg.TraefikDockerDNS, cfg.TraefikDialPort)
 	if cfg.BearerToken != "" {
 		rt = NewBearerRoundTripper(rt, cfg.BearerToken)
 	}
 	return &http.Client{
-		Timeout:   clientTimeout,
-		Transport: rt,
+		Timeout:       clientTimeout,
+		Transport:     rt,
+		CheckRedirect: refuseCrossOriginRedirect,
 	}
 }
