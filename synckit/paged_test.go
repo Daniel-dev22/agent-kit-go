@@ -22,6 +22,10 @@ func pager(total, per int) PullFunc {
 	}
 }
 
+func noApply(t *testing.T) func(Response) error {
+	return func(Response) error { t.Fatal("apply must not run for this page"); return nil }
+}
+
 func TestPullPagedAppliesEachPageThenAdvances(t *testing.T) {
 	var got, calls int
 	rev, err := PullPaged(context.Background(), pager(10, 3), 0, nil, 3, func(r Response) error {
@@ -31,6 +35,28 @@ func TestPullPagedAppliesEachPageThenAdvances(t *testing.T) {
 	})
 	if err != nil || rev != 10 || got != 10 || calls != 4 {
 		t.Fatalf("rev=%d got=%d calls=%d err=%v", rev, got, calls, err)
+	}
+}
+
+// L4: the exact requests PullPaged sends, byte for byte. Follow-up pages carry
+// `changes:[]` (the contract/fixture shape), never null.
+func TestPullPagedRequestBytes(t *testing.T) {
+	var sent []string
+	inner := pager(4, 2)
+	pull := func(ctx context.Context, r Request) (Response, error) {
+		b, _ := json.Marshal(r)
+		sent = append(sent, string(b))
+		return inner(ctx, r)
+	}
+	if _, err := PullPaged(context.Background(), pull, 0, nil, 2, func(Response) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		`{"since":0,"changes":[],"limit":2}`,
+		`{"since":2,"changes":[],"limit":2}`,
+	}
+	if len(sent) != 2 || sent[0] != want[0] || sent[1] != want[1] {
+		t.Fatalf("sent=%v", sent)
 	}
 }
 
@@ -64,33 +90,86 @@ func TestPullPagedApplyFailureStopsAndKeepsCursor(t *testing.T) {
 	}
 }
 
-func TestPullPagedResync(t *testing.T) {
+func TestPullPagedResyncRefusesAndNeverApplies(t *testing.T) {
 	pull := func(context.Context, Request) (Response, error) {
-		return Response{ResyncRequired: true, MinRetainedRev: 9}, nil
+		return Response{ResyncRequired: true, MinRetainedRev: 9, Deduped: []Deduped{{ID: "x", Of: "y"}}}, nil
 	}
-	_, err := PullPaged(context.Background(), pull, 4, nil, 3, func(Response) error {
-		t.Fatal("apply must not run on resync")
-		return nil
-	})
+	_, err := PullPaged(context.Background(), pull, 4, nil, 3, noApply(t))
 	if !errors.Is(err, ErrResync) {
 		t.Fatalf("err=%v", err)
 	}
 }
 
-func TestPullPagedStuckServerErrors(t *testing.T) {
-	pull := func(context.Context, Request) (Response, error) { return Response{ServerRev: 5, More: true}, nil }
-	if _, err := PullPaged(context.Background(), pull, 5, nil, 3, func(Response) error { return nil }); err == nil {
-		t.Fatal("expected non-advancing error")
+// L3: since=0 never resyncs; answering so is a protocol error, not ErrResync,
+// so a caller's reset-and-retry loop cannot spin forever.
+func TestPullPagedResyncAtZeroIsProtocolError(t *testing.T) {
+	pull := func(context.Context, Request) (Response, error) { return Response{ResyncRequired: true}, nil }
+	_, err := PullPaged(context.Background(), pull, 0, nil, 3, noApply(t))
+	if !errors.Is(err, ErrProtocol) || errors.Is(err, ErrResync) {
+		t.Fatalf("err=%v", err)
 	}
 }
 
-func TestLegacyWireOmitsPagingFields(t *testing.T) {
+// M1: a bad page is rejected BEFORE apply, so a cursor-saving apply can never
+// persist a regression. A recording apply would see the page; none must run.
+func TestPullPagedRejectsBadPagesBeforeApply(t *testing.T) {
+	cases := map[string]Response{
+		"more but stuck":       {ServerRev: 500, More: true},
+		"more but regressed":   {ServerRev: 200, More: true, Records: []Record{{ID: "a", Rev: 200}}},
+		"more, rev != last":    {ServerRev: 900, More: true, Records: []Record{{ID: "a", Rev: 600}}},
+		"final but regressed":  {ServerRev: 200},
+		"final regressed+recs": {ServerRev: 499, Records: []Record{{ID: "a", Rev: 499}}},
+	}
+	for name, resp := range cases {
+		t.Run(name, func(t *testing.T) {
+			pull := func(context.Context, Request) (Response, error) { return resp, nil }
+			rev, err := PullPaged(context.Background(), pull, 500, nil, 3, noApply(t))
+			if !errors.Is(err, ErrProtocol) || rev != 500 {
+				t.Fatalf("rev=%d err=%v", rev, err)
+			}
+		})
+	}
+}
+
+// M1: with an apply that saves ServerRev, the stored cursor never moves backwards.
+func TestPullPagedStoredCursorNeverRegresses(t *testing.T) {
+	stored := int64(500)
+	pull := func(context.Context, Request) (Response, error) { return Response{ServerRev: 200, More: true}, nil }
+	_, err := PullPaged(context.Background(), pull, 500, nil, 3, func(r Response) error {
+		stored = r.ServerRev
+		return nil
+	})
+	if err == nil || stored != 500 {
+		t.Fatalf("stored cursor regressed to %d (err=%v)", stored, err)
+	}
+}
+
+// L5: a cancelled context stops the loop even though pull would succeed.
+func TestPullPagedStopsOnCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	pages := 0
+	_, err := PullPaged(ctx, pager(100, 1), 0, nil, 1, func(Response) error {
+		pages++
+		if pages == 2 {
+			cancel()
+		}
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || pages != 2 {
+		t.Fatalf("pages=%d err=%v", pages, err)
+	}
+}
+
+// L6: the new fields are absent at their zero values. Conflicts becoming
+// omitempty is a deliberate change (the server omits it); compat with the
+// old wire is proven separately in compat_test.go.
+func TestPagingFieldsOmittedAtZeroValues(t *testing.T) {
 	b, _ := json.Marshal(Request{Since: 1})
 	if string(b) != `{"since":1,"changes":null}` {
-		t.Fatalf("legacy request changed: %s", b)
+		t.Fatalf("request: %s", b)
 	}
 	b, _ = json.Marshal(Response{ServerRev: 2})
 	if string(b) != `{"server_rev":2,"records":null}` {
-		t.Fatalf("legacy response changed: %s", b)
+		t.Fatalf("response: %s", b)
 	}
 }

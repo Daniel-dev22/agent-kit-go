@@ -1,6 +1,9 @@
 package synckit
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"reflect"
@@ -8,8 +11,19 @@ import (
 )
 
 // testdata_sync_golden.json is a verbatim copy of agent-skills
-// docs/memory_api_sync_golden.json (540258f): the wire fixture memory-api and
-// this client must both round-trip JSON-equal, omitted keys included.
+// docs/memory_api_sync_golden.json at ec5e84c (6 cases): the wire fixture
+// memory-api and this client must both round-trip JSON-equal, omitted keys
+// included.
+//
+// To update it: copy the canonical file over testdata_sync_golden.json, set
+// goldenSHA256 to `sha256sum` of it, extend wantCases. The release gate runs
+// with KIT_GOLDEN_CANONICAL=/docker_container_volumes/agent-skills/docs/memory_api_sync_golden.json
+// which makes TestGoldenMatchesCanonical byte-compare against the live file, so
+// a canonical change cannot leave this suite green on a stale copy.
+const goldenSHA256 = "03f65739db2a10176e2008d9d1bfd675a46e6e118ca409a4f684c63180d0bbde"
+
+var wantCases = []string{"push_and_first_page", "last_page_no_changes", "dedup_on_push", "conflict_on_push", "more_with_deduped", "resync_required"}
+
 type goldenFile struct {
 	Cases []struct {
 		Name     string          `json:"name"`
@@ -39,6 +53,32 @@ func jsonEqual(t *testing.T, what string, typed any, raw json.RawMessage) {
 	}
 }
 
+func TestGoldenPinnedHash(t *testing.T) {
+	data, err := os.ReadFile("testdata_sync_golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	if got := hex.EncodeToString(sum[:]); got != goldenSHA256 {
+		t.Fatalf("fixture copy changed (sha256 %s); re-copy the canonical file and update goldenSHA256 + wantCases", got)
+	}
+}
+
+func TestGoldenMatchesCanonical(t *testing.T) {
+	path := os.Getenv("KIT_GOLDEN_CANONICAL")
+	if path == "" {
+		t.Skip("set KIT_GOLDEN_CANONICAL to byte-compare against the canonical fixture (release gate)")
+	}
+	canon, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, _ := os.ReadFile("testdata_sync_golden.json")
+	if !bytes.Equal(canon, local) {
+		t.Fatalf("kit copy has drifted from %s", path)
+	}
+}
+
 func TestGoldenWireRoundTrip(t *testing.T) {
 	data, err := os.ReadFile("testdata_sync_golden.json")
 	if err != nil {
@@ -48,8 +88,12 @@ func TestGoldenWireRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &g); err != nil {
 		t.Fatal(err)
 	}
-	if len(g.Cases) < 4 {
-		t.Fatalf("fixture has %d cases, want >= 4", len(g.Cases))
+	var names []string
+	for _, c := range g.Cases {
+		names = append(names, c.Name)
+	}
+	if !reflect.DeepEqual(names, wantCases) {
+		t.Fatalf("cases = %v, want %v", names, wantCases)
 	}
 	for _, c := range g.Cases {
 		t.Run(c.Name, func(t *testing.T) {
