@@ -183,3 +183,61 @@ func TestInvalidTable(t *testing.T) {
 		t.Fatal("a non-identifier table name must be refused")
 	}
 }
+
+// Wake makes a subject's deferred intents due now; it matches the subject
+// exactly (a LIKE on a pane id would wake %1 when %21 goes idle) and never
+// touches running or terminal rows.
+func TestWakeIsExactAndPendingOnly(t *testing.T) {
+	ctx := context.Background()
+	c := &clock{t: time.Unix(1_000_000, 0)}
+	q := newQ(t, filepath.Join(t.TempDir(), "q.db"), c, nil)
+	ids := map[string]int64{}
+	for _, s := range []string{"%1", "%21", "%11"} {
+		ids[s], _, _, _ = q.Enqueue(ctx, Item{Key: "k" + s, Kind: "clear", Subject: s})
+	}
+	for range ids { // claim and defer each 1h out
+		in, _ := q.Claim(ctx, "a", time.Minute)
+		if err := q.Defer(ctx, in.ID, "a", c.now().Add(time.Hour), "busy"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok, _ := q.NextDue(ctx); !ok {
+		t.Fatal("NextDue must see the deferred rows")
+	}
+	n, err := q.Wake(ctx, "%1")
+	if err != nil || n != 1 {
+		t.Fatalf("Wake(%%1) must wake exactly one row, got %d %v", n, err)
+	}
+	in, _ := q.Claim(ctx, "a", time.Minute)
+	if in == nil || in.ID != ids["%1"] {
+		t.Fatalf("only %%1 may be due: %+v", in)
+	}
+	if n, _ := q.Wake(ctx, "%1"); n != 0 {
+		t.Fatalf("a running row must not be woken, got %d", n)
+	}
+	if again, _ := q.Claim(ctx, "a", time.Minute); again != nil {
+		t.Fatalf("%%21/%%11 must stay deferred, claimed %+v", again)
+	}
+	if _, err := q.Wake(ctx, ""); err == nil {
+		t.Fatal("an empty subject must be refused")
+	}
+}
+
+func TestNextDue(t *testing.T) {
+	ctx := context.Background()
+	c := &clock{t: time.Unix(1_000_000, 0)}
+	q := newQ(t, filepath.Join(t.TempDir(), "q.db"), c, nil)
+	if _, ok, err := q.NextDue(ctx); ok || err != nil {
+		t.Fatalf("empty queue: ok=%v err=%v", ok, err)
+	}
+	id, _, _, _ := q.Enqueue(ctx, Item{Key: "k", Kind: "clear"})
+	in, _ := q.Claim(ctx, "a", time.Minute)
+	due := c.now().Add(30 * time.Second)
+	if err := q.Defer(ctx, id, "a", due, "busy"); err != nil || in == nil {
+		t.Fatal(err)
+	}
+	got, ok, err := q.NextDue(ctx)
+	if err != nil || !ok || !got.Equal(due) {
+		t.Fatalf("NextDue=%v ok=%v err=%v, want %v", got, ok, err, due)
+	}
+}

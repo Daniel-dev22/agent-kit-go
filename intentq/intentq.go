@@ -55,6 +55,9 @@ type Item struct {
 	Kind    string
 	Payload []byte
 	TTL     time.Duration
+	// Subject groups intents by the thing they act on (e.g. a pane id) so an
+	// event about that thing can Wake exactly its pending intents. Optional.
+	Subject string
 }
 
 // Intent is a stored row.
@@ -97,8 +100,10 @@ func New(ctx context.Context, db *sql.DB, cfg Config) (*Queue, error) {
 			id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, payload BLOB,
 			state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
 			created_ms INTEGER NOT NULL, next_ms INTEGER NOT NULL, expires_ms INTEGER NOT NULL,
-			lease_owner TEXT NOT NULL DEFAULT '', lease_ms INTEGER NOT NULL DEFAULT 0, updated_ms INTEGER NOT NULL)`, q.t),
+			lease_owner TEXT NOT NULL DEFAULT '', lease_ms INTEGER NOT NULL DEFAULT 0, updated_ms INTEGER NOT NULL,
+				subject TEXT NOT NULL DEFAULT '')`, q.t),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_claim ON %s(state, next_ms)`, q.t, q.t),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s_subject ON %s(state, subject)`, q.t, q.t),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s_stages (
 			id INTEGER PRIMARY KEY AUTOINCREMENT, intent_id INTEGER NOT NULL, attempt INTEGER NOT NULL,
 			stage TEXT NOT NULL, state TEXT NOT NULL, facts BLOB, at_ms INTEGER NOT NULL)`, q.t),
@@ -127,9 +132,9 @@ func (q *Queue) Enqueue(ctx context.Context, it Item) (id int64, state State, cr
 	}
 	now := q.cfg.Now()
 	res, err := q.db.ExecContext(ctx, fmt.Sprintf(
-		`INSERT INTO %s(key,kind,payload,state,created_ms,next_ms,expires_ms,updated_ms) VALUES(?,?,?,?,?,?,?,?)
+		`INSERT INTO %s(key,kind,payload,state,created_ms,next_ms,expires_ms,updated_ms,subject) VALUES(?,?,?,?,?,?,?,?,?)
 		 ON CONFLICT(key) DO NOTHING`, q.t),
-		it.Key, it.Kind, it.Payload, string(Pending), ms(now), ms(now), ms(now.Add(ttl)), ms(now))
+		it.Key, it.Kind, it.Payload, string(Pending), ms(now), ms(now), ms(now.Add(ttl)), ms(now), it.Subject)
 	if err != nil {
 		return 0, "", false, err
 	}
@@ -290,6 +295,36 @@ func (q *Queue) Prune(ctx context.Context) (int64, error) {
 		}
 	}
 	return total, nil
+}
+
+// Wake makes every PENDING, unexpired intent with this subject due now, so an
+// event about the subject (a pane going idle) retries its deferred intents at
+// once instead of waiting out the backoff. Running and terminal rows are never
+// touched. It returns how many rows were woken.
+func (q *Queue) Wake(ctx context.Context, subject string) (int64, error) {
+	if subject == "" {
+		return 0, errors.New("intentq: Wake needs a subject")
+	}
+	now := q.cfg.Now()
+	res, err := q.db.ExecContext(ctx, fmt.Sprintf(
+		`UPDATE %s SET next_ms=?, updated_ms=? WHERE state='pending' AND subject=? AND next_ms>? AND expires_ms>?`, q.t),
+		ms(now), ms(now), subject, ms(now), ms(now))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// NextDue returns when the earliest unexpired pending intent becomes due, so a
+// worker can sleep exactly that long. ok is false when nothing is pending.
+func (q *Queue) NextDue(ctx context.Context) (t time.Time, ok bool, err error) {
+	var n sql.NullInt64
+	err = q.db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT MIN(next_ms) FROM %s WHERE state='pending' AND expires_ms>?`, q.t), ms(q.cfg.Now())).Scan(&n)
+	if err != nil || !n.Valid {
+		return time.Time{}, false, err
+	}
+	return time.UnixMilli(n.Int64), true, nil
 }
 
 // Get returns one intent by id.
