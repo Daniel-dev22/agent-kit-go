@@ -38,6 +38,9 @@ func (s State) terminal() bool {
 // ErrNotOwner is returned when an intent is not running under the caller's lease.
 var ErrNotOwner = errors.New("intentq: intent is not running under this owner")
 
+// ErrNotFound is returned by Get when no intent has the id.
+var ErrNotFound = errors.New("intentq: intent not found")
+
 var identRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,62}$`)
 
 // Config for a Queue.
@@ -161,16 +164,34 @@ func scan(r interface{ Scan(...any) error }) (*Intent, error) {
 // Claim atomically takes the oldest due, unexpired pending intent under a lease, or returns (nil, nil).
 // One statement, so concurrent claimers never get the same row.
 func (q *Queue) Claim(ctx context.Context, owner string, lease time.Duration) (*Intent, error) {
+	// A cancelled ctx must never leave a committed claim behind: refuse before touching
+	// the DB, and commit only after the row was read back (any error rolls the claim back).
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	now := q.cfg.Now()
-	row := q.db.QueryRowContext(ctx, fmt.Sprintf(
+	in, err := scan(tx.QueryRowContext(ctx, fmt.Sprintf(
 		`UPDATE %s SET state='running', attempts=attempts+1, lease_owner=?, lease_ms=?, updated_ms=?
 		 WHERE id=(SELECT id FROM %s WHERE state='pending' AND next_ms<=? AND expires_ms>? ORDER BY next_ms,id LIMIT 1)
-		 RETURNING %s`, q.t, q.t, cols), owner, ms(now.Add(lease)), ms(now), ms(now), ms(now))
-	in, err := scan(row)
+		 RETURNING %s`, q.t, q.t, cols), owner, ms(now.Add(lease)), ms(now), ms(now), ms(now)))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
-	return in, err
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return in, nil
 }
 
 // Record appends a stage receipt for an attempt.
@@ -229,6 +250,9 @@ type Recovered struct {
 
 // Recover is the boot/backstop sweep: running intents whose lease ended become uncertain
 // (a keystroke may have gone out), pending intents past their TTL become expired. Neither is replayed.
+//
+// It is safe to call periodically while workers run: it only flips running rows whose
+// lease has ended (a live lease is untouched) and pending rows whose TTL has elapsed.
 func (q *Queue) Recover(ctx context.Context) ([]Recovered, error) {
 	now := q.cfg.Now()
 	var out []Recovered
@@ -270,13 +294,23 @@ func (q *Queue) Prune(ctx context.Context) (int64, error) {
 	now := q.cfg.Now()
 	term := `state IN ('done','failed','uncertain','expired','cancelled')`
 	var total int64
+	// Stage and parent deletes share one transaction so a Finish landing mid-prune can
+	// never leave orphan stage rows (or a parent whose stages are already gone).
 	del := func(where string, args ...any) error {
-		if _, err := q.db.ExecContext(ctx, fmt.Sprintf(
+		tx, err := q.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(
 			`DELETE FROM %s_stages WHERE intent_id IN (SELECT id FROM %s WHERE %s)`, q.t, q.t, where), args...); err != nil {
 			return err
 		}
-		res, err := q.db.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s`, q.t, where), args...)
+		res, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s`, q.t, where), args...)
 		if err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
 			return err
 		}
 		n, _ := res.RowsAffected()
@@ -341,15 +375,21 @@ func (q *Queue) NextDue(ctx context.Context) (t time.Time, ok bool, err error) {
 	return time.UnixMilli(n.Int64), true, nil
 }
 
-// Get returns one intent by id.
+// Get returns one intent by id, or ErrNotFound when no such row exists.
 func (q *Queue) Get(ctx context.Context, id int64) (*Intent, error) {
-	return scan(q.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT %s FROM %s WHERE id=?`, cols, q.t), id))
+	in, err := scan(q.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT %s FROM %s WHERE id=?`, cols, q.t), id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return in, err
 }
 
-// OldestPendingAge is the status metric: how long the oldest due pending intent has waited (0 when none).
+// OldestPendingAge is the status metric: how long the oldest unexpired pending intent has waited (0 when none).
+// Rows past their TTL are excluded: they are about to be expired by Recover and must not read as a stall.
 func (q *Queue) OldestPendingAge(ctx context.Context) (time.Duration, error) {
 	var c sql.NullInt64
-	err := q.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT MIN(created_ms) FROM %s WHERE state='pending'`, q.t)).Scan(&c)
+	err := q.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT MIN(created_ms) FROM %s WHERE state='pending' AND expires_ms>?`, q.t),
+		ms(q.cfg.Now())).Scan(&c)
 	if err != nil || !c.Valid {
 		return 0, err
 	}

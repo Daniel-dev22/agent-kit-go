@@ -39,6 +39,28 @@ func TestRoundTripAndMode(t *testing.T) {
 	}
 }
 
+// The Client verifies the SERVER's SO_PEERCRED uid on every dial. Same-uid passes
+// (TestRoundTripAndMode). A server running as a different uid is refused with
+// ErrWrongPeer, but that cannot be unit-tested without a second uid; here we only
+// assert the verification reads the real server uid (equal to ours for a local listener).
+func TestClientChecksServerUID(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "s.sock")
+	serve(t, p, os.Getuid())
+	c, err := net.Dial("unix", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if got := peerUID(c); got != os.Getuid() {
+		t.Fatalf("server uid as seen by the client: %d, want %d", got, os.Getuid())
+	}
+	if resp, err := Client(p, time.Second).Get("http://x/ping"); err != nil {
+		t.Fatalf("same-uid server must be accepted: %v", err)
+	} else {
+		resp.Body.Close()
+	}
+}
+
 func TestWrongUIDRejected(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "s.sock")
 	serve(t, p, os.Getuid()+1)

@@ -94,14 +94,28 @@ func peerUID(c net.Conn) int {
 	return uid
 }
 
+// ErrWrongPeer is returned by a Client dial when the socket's server runs as a different uid.
+var ErrWrongPeer = errors.New("unixhttp: socket server uid differs from the caller's")
+
 // Client returns an http.Client that dials the socket at path whatever the URL host is.
+// Every dial verifies the server's SO_PEERCRED uid equals the caller's uid and refuses
+// (closing the connection) otherwise, so a socket planted by another user is never trusted.
 func Client(path string, timeout time.Duration) *http.Client {
+	uid := os.Getuid()
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
-				return d.DialContext(ctx, "unix", path)
+				c, err := d.DialContext(ctx, "unix", path)
+				if err != nil {
+					return nil, err
+				}
+				if got := peerUID(c); got != uid {
+					c.Close()
+					return nil, fmt.Errorf("%w (server uid %d, caller uid %d)", ErrWrongPeer, got, uid)
+				}
+				return c, nil
 			},
 			MaxIdleConns:    2,
 			IdleConnTimeout: 30 * time.Second,
