@@ -241,3 +241,28 @@ func TestNextDue(t *testing.T) {
 		t.Fatalf("NextDue=%v ok=%v err=%v, want %v", got, ok, err, due)
 	}
 }
+
+func TestWakeAllIsPendingOnly(t *testing.T) {
+	ctx := context.Background()
+	c := &clock{t: time.Unix(1_000_000, 0)}
+	q := newQ(t, filepath.Join(t.TempDir(), "q.db"), c, nil)
+	for _, s := range []string{"%1", "%2"} {
+		q.Enqueue(ctx, Item{Key: "k" + s, Kind: "clear", Subject: s})
+	}
+	a, _ := q.Claim(ctx, "a", time.Minute) // %1 running
+	b, _ := q.Claim(ctx, "a", time.Minute)
+	if err := q.Defer(ctx, b.ID, "a", c.now().Add(time.Hour), "busy"); err != nil { // %2 pending, 1h out
+		t.Fatal(err)
+	}
+	if again, _ := q.Claim(ctx, "a", time.Minute); again != nil {
+		t.Fatalf("deferred row must not be due: %+v", again)
+	}
+	n, err := q.WakeAll(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("WakeAll must wake exactly the one deferred row, got %d %v", n, err)
+	}
+	if got, _ := q.Claim(ctx, "a", time.Minute); got == nil || got.ID != b.ID {
+		t.Fatalf("woken row must be claimable: %+v", got)
+	}
+	_ = a
+}

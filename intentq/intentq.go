@@ -315,6 +315,20 @@ func (q *Queue) Wake(ctx context.Context, subject string) (int64, error) {
 	return res.RowsAffected()
 }
 
+// WakeAll makes every PENDING, unexpired intent due now. It is the boot sweep:
+// backoff timers were set by a process that no longer exists, and a pane may have
+// gone quiet while no trigger was watching. Running and terminal rows are never touched.
+func (q *Queue) WakeAll(ctx context.Context) (int64, error) {
+	now := q.cfg.Now()
+	res, err := q.db.ExecContext(ctx, fmt.Sprintf(
+		`UPDATE %s SET next_ms=?, updated_ms=? WHERE state='pending' AND next_ms>? AND expires_ms>?`, q.t),
+		ms(now), ms(now), ms(now), ms(now))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // NextDue returns when the earliest unexpired pending intent becomes due, so a
 // worker can sleep exactly that long. ok is false when nothing is pending.
 func (q *Queue) NextDue(ctx context.Context) (t time.Time, ok bool, err error) {
