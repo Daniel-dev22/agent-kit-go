@@ -49,6 +49,14 @@ type GatedConfig struct {
 	BackoffMax  time.Duration // default Interval
 	PostTimeout time.Duration // default 15s
 
+	// OnReply, when set, receives the raw body of every 2xx reply that parses as a confirmation
+	// (applied present), BEFORE the gate acts on it, so a consumer can read fields the kit does not
+	// know (e.g. a capability list the controller advertises). It is called on the tick goroutine
+	// and must not block; body is only valid for the duration of the call (copy to keep it, at most
+	// 64 KiB). Replies that fail to parse, non-2xx replies and transport errors never call it.
+	// Optional: nil keeps the existing behaviour byte for byte.
+	OnReply func(body []byte)
+
 	Now    func() time.Time
 	Rand   func() float64
 	Logger *slog.Logger
@@ -267,6 +275,9 @@ func (g *Gated) post(ctx context.Context, body []byte) (applied, want bool, err 
 	}
 	if json.Unmarshal(rb, &r) != nil || r.Applied == nil {
 		return false, false, nil
+	}
+	if g.cfg.OnReply != nil {
+		g.cfg.OnReply(rb)
 	}
 	return *r.Applied, r.Want, nil
 }
