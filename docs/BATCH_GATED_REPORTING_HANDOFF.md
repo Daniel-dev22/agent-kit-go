@@ -18,9 +18,11 @@ Branch `feat/batch-gated-reporting` (worktree `/docker_container_volumes/agent-r
 | gate | result |
 |---|---|
 | `go vet ./...`, `go test -race ./eventoutbox ./reconcile` | clean |
-| coverage | eventoutbox 85.8% (new batch.go well above; legacy outbox.go lowers it), reconcile 97.2% |
+| coverage (package floor 95) | eventoutbox 95.2% (batch.go 95.6%, outbox.go 93.2%), reconcile 95.9% (gated.go 99.0%, reconcile.go 89.4%); `go test -coverprofile`, statement-weighted per file |
+| single connection | `KIT_SINGLE_CONN=1 go test -race ./eventoutbox` (db.SetMaxOpenConns(1), the agent's one-connection mode): ok, no nested-query deadlock |
 | mutation eventoutbox (`cmd/mutate`, -j 2) | 317 generated, 33 invalid, 284 valid, 257 killed, 27 listed equivalent (`eventoutbox/testdata/survivors.txt`), 0 problems |
-| mutation reconcile | 104 generated, 3 invalid, 101 valid, 94 killed, 7 listed equivalent (`reconcile/testdata/survivors.txt`) |
+| mutation reconcile (re-verified after removing a stale entry) | 104 generated, 3 invalid, 101 valid, 94 killed, 7 listed equivalent (`reconcile/testdata/survivors.txt`), 0 problems |
+| mutation command | `scripts/capped.sh -m 2G -- go -C <ecmp-health-agent worktree> run ./cmd/mutate -dir <kit> -pkg eventoutbox\|reconcile -j 2 -timeout 90s -report <file>` (harness lives in the ecmp-health-agent repo; survivors files are keyed `file:line:col`, so any edit of a mutated .go file needs a re-run) |
 | peak memory | race tests 95-193 MB; vet/build 816 MB; mutation per run under the 2 GB cap |
 
 ## Consumer repos against this kit (go.work, capped 3G, one at a time, `go test -count=1 ./...`)
@@ -35,7 +37,21 @@ Branch `feat/batch-gated-reporting` (worktree `/docker_container_volumes/agent-r
 ## Frozen closure the ECMP agent's policy test must pin (kit go.mod at this commit)
 golang.org/x/sys v0.42.0, modernc.org/sqlite v1.50.0, modernc.org/libc v1.72.0, modernc.org/mathutil v1.7.1, modernc.org/memory v1.11.0, github.com/dustin/go-humanize v1.0.1, github.com/google/uuid v1.6.0, github.com/mattn/go-isatty v0.0.20, github.com/ncruces/go-strftime v1.0.0, github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec. Unchanged by this commit.
 
+## Pi-class numbers (taskset -c 3, GOMAXPROCS=1, -count 10, i5-1340P = smoke alarm, gate = allocs/op and POST count)
+Min ns/op over 10 runs, WAL file DB on /var/tmp (synchronous=NORMAL, one connection), in-process RoundTripper (no socket):
+| bench | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| BatchEnqueue (1 INSERT + poke) | 16186 | 1001 | 22 |
+| BatchBuild100 (stamp + encode 100 events) | 12526 | 33425 | 24 |
+| BatchDrain100 (load 100, build, 1 POST, delete 100) | 429545 | 119025 | 1569 |
+| LegacyEnqueuePush100 (before: 100 Enqueue + 100 POSTs) | 7746875 | 270631 | 4229 |
+| GateDecide | 15.2 | 0 | 0 |
+| GatedTickSkip (unchanged fingerprint, inside bound, no POST) | 52.3 | 4 | 2 |
+Op counts asserted inside the benchmarks: BatchDrain100 = exactly 1 POST per 100 events (legacy = 100), GatedTickSkip = 0 POSTs after the first full. 100 events cost about 100 x 16 us + 430 us = 2.0 ms batched vs 7.75 ms legacy (3.9x less CPU, 100x fewer requests). The NAS-pool fsync decision (NORMAL vs FULL) is slice C's measurement, not made here.
+
+## Uncovered branches (each is a defensive error path with no cheap trigger)
+batch.go: crypto/rand.Read failure (217), tx Commit failure after a successful schema (227), scan errors on a driver row (415, 551, 588-599), delete-statement prepare/exec failure inside a transaction (613-627), prune query failure (686). outbox.go (legacy, untouched): CREATE failure after a successful open (73), delete-after-push warn (118), per-row scan failure (174-176), ctx.Done inside the push loop after a successful query (187). Each logs and backs off; none changes a delivery decision.
+
 ## Not measured / follow-ups
-- Pi-class (CPU-pinned) numbers for the batch drain are NOT taken: it runs per event/pass, not per probe cycle, and was not benchmarked. The ECMP agent's slice C hand-off carries the end-to-end number.
 - The outbox DB must be opened with `busy_timeout` and WAL like `New` (documented on `NewBatch`).
 - `BatchOutbox.Stats()` / `LastSeq()` read `sqlite_sequence`; a non-SQLite driver would need its own equivalent.

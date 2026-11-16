@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -64,6 +65,11 @@ func newDB(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
+	if os.Getenv("KIT_SINGLE_CONN") == "1" {
+		// The ECMP agent runs ONE connection and one writer: any nested query (rows held open
+		// while another statement runs) deadlocks here and passes under the default pool.
+		db.SetMaxOpenConns(1)
+	}
 	return db
 }
 
