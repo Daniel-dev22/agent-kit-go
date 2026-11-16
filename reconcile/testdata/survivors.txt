@@ -1,0 +1,10 @@
+# Mutants of reconcile that survive, each with the argument. cmd/mutate refuses a survivor with no reason.
+# gated.go (this extension)
+gated.go:129:18 cmp >->>= | Interval > MaxSilence vs >=: when they are equal the assignment writes the same value
+gated.go:182:9 cmp !=->== | the branch only writes a log line; the send decision uses fpOK, which is tested
+gated.go:221:3 guard removed (=>false) | the guard only sets the failing flag that rate-limits one log line
+gated.go:227:15 logic ||->&& | the condition only gates the one-time "converged" log line
+# reconcile.go (pre-existing Run path, NOT modified by the gated extension; its wire bytes are pinned by TestGoldenWireRunSnapshot)
+reconcile.go:81:17 const 0->1 | Interval <= 1 vs <= 0: a 1ns interval is a spin loop, not a configuration anyone can test
+reconcile.go:86:41 cmp !=->== | legacy: only selects a log line after the first push
+reconcile.go:97:43 cmp !=->== | legacy: only selects a log line after a failed tick push

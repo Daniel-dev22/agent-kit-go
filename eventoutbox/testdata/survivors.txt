@@ -1,0 +1,31 @@
+# Mutants of eventoutbox that survive because they are equivalent, each with the argument.
+# cmd/mutate refuses a survivor with no reason and any survivor not listed here.
+# batch.go (this extension)
+batch.go:241:14 const 2->1 | a payload of length 1 is rejected by the p[0]/p[len-1] checks anyway ('{' is not '}'); length 0 fails the same way
+batch.go:307:25 const 0->1 | NewTimer(1ns) vs NewTimer(0): both fire at once; the first drain is not observable as different
+batch.go:436:16 const 2->3 | an envelope is a JSON object: '{}' is 2 bytes and the next shortest object is far longer than 3, so 3 never occurs
+batch.go:448:23 const 2->3 | a stored payload is a JSON object: '{}' is 2 bytes, no valid object is 3 bytes
+batch.go:486:18 const 1->0 | max(1, n/2) with n >= 2 (guarded by len(rows) > 1) is n/2 >= 1, so the floor never applies
+batch.go:506:18 const 1->0 | same: guarded by len(rows) > 1
+batch.go:491:81 cmp >=->> | st == 500 falls to the default arm, which also retries: identical outcome
+batch.go:491:84 const 500->501 | same: 500 reaches the default arm, which retries
+batch.go:494:23 cmp <-><= | 500 is claimed by the earlier >= 500 case, so the 4xx arm never sees it
+batch.go:494:25 const 500->501 | same
+batch.go:600:2 defer Close removed | the statement is prepared on a transaction; Commit and Rollback close it, so the explicit Close is redundant
+batch.go:646:63 const 1->2 | the limit argument is a sentinel: any negative number means no LIMIT clause
+batch.go:648:7 cmp >->>= | at n == MaxRows the drop count n-MaxRows is 0 and the query is LIMIT 0: nothing is dropped either way
+batch.go:651:22 cmp >->>= | same at n == HardRows
+batch.go:664:11 cmp >=->> | limit is either the -1 sentinel or >= 1 (a drop count is only requested when positive), so >= 0 and > 0 agree
+batch.go:664:14 const 0->1 | same
+# outbox.go (pre-existing path, NOT modified by the batch extension; its wire bytes are pinned by TestGoldenWireEnqueuePush)
+outbox.go:32:25 const 5->6 | push timeout: observing 5s vs 6s needs a hung server and a multi-second test for a constant nobody changes
+outbox.go:32:25 const 5->4 | same
+outbox.go:118:81 cmp !=->== | only selects a log line when deleting an already-pushed row fails
+outbox.go:123:54 const 4096->4097 | the read is capped at 4096 but only the first 200 bytes are kept (truncate), so the cap is not observable
+outbox.go:123:54 const 4096->4095 | same
+outbox.go:132:9 cmp !=->== | only selects a log line when recording a failure fails
+outbox.go:184:12 const 0->1 | the pushed counter only feeds the drained log line
+outbox.go:196:12 cmp >->>= | same
+outbox.go:196:12 cmp >-><= | same
+outbox.go:196:14 const 0->1 | same
+outbox.go:212:12 cmp >->>= | truncate: at len(s) == n, s[:n] is s
