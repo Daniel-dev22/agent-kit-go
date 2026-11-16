@@ -57,7 +57,7 @@ type GatedConfig struct {
 	// Optional: nil keeps the existing behaviour byte for byte.
 	OnReply func(body []byte)
 
-	Now   func() time.Time
+	Now    func() time.Time
 	Rand   func() float64
 	Logger *slog.Logger
 }
