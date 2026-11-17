@@ -101,12 +101,16 @@ type BatchConfig struct {
 	BisectOnRefusalCodes []string
 
 	// SupersedeKey (optional) maps an event to a key; "" means no key. Enqueueing an event with a
-	// key deletes every older, still-unacked row with the same key in the same transaction, so a
-	// repeated recovery event (e.g. a boot marker) is bounded to one row. The new row keeps the
-	// strongest protection of the rows it replaces. seq stays monotonic (a new AUTOINCREMENT id;
-	// the removed ids are simply gone, as for any acked row) and FIFO order is untouched. A
-	// replaced row is NOT passed to OnDead (the newer event carries the same fact): it is counted
-	// in BatchStats.Superseded. Setting it adds a nullable supersede_key column to batch_events.
+	// key replaces every older, still-unacked row with the same key in the same transaction, so a
+	// repeated recovery event (e.g. a boot marker) is bounded to one row. The replacement KEEPS THE
+	// OLDEST SEQ of those rows (the oldest row is updated in place, the younger same-key rows are
+	// deleted), so it never jumps behind events enqueued after the first one: boot1
+	// agent_started(1), node_removed(2), boot2 agent_started still delivers 1 then 2. A row the
+	// drainer holds in flight is never updated (its ack would delete the newer payload): a new row
+	// is inserted behind it instead. The row keeps the strongest protection of the rows it
+	// replaces. seq stays monotonic for every other row and FIFO order is untouched. A replaced
+	// payload is NOT passed to OnDead (the newer event carries the same fact): each replacement is
+	// counted in BatchStats.Superseded. Setting it adds a nullable supersede_key column to batch_events.
 	SupersedeKey func(kind string, payload []byte) string
 
 	OnDead func(DeadLetter) // called for every event removed undelivered, except those superseded
@@ -174,6 +178,8 @@ type BatchOutbox struct {
 	dead       atomic.Int64
 	dropped    atomic.Int64
 	superseded atomic.Int64
+	inflightMu sync.Mutex         // orders load()'s marking against enqueueSuperseding's check
+	inflight   map[int64]struct{} // ids of the batch the drainer holds; kept only with SupersedeKey
 	epochChg   atomic.Int64
 	bisect     map[string]struct{} // BisectOnRefusalCodes as a set; nil when empty
 	failing    bool                // drainer-owned: logging on state change only
@@ -365,35 +371,89 @@ func (o *BatchOutbox) supersedeKey(kind string, payload []byte) string {
 	return o.cfg.SupersedeKey(kind, payload)
 }
 
-// enqueueSuperseding inserts the event and deletes its older same-key rows in ONE transaction
-// (one commit), so a crash can never leave both or neither. The new row inherits the strongest
-// protection of the rows it replaces: a protected recovery event is never downgraded by a
-// successor that the caller happened to enqueue unprotected.
+// enqueueSuperseding replaces the unacked rows of key with this event in ONE transaction (one
+// commit), so a crash can never leave both or neither, and the replacement KEEPS THE OLDEST SEQ:
+// the oldest row of the key that is not in flight is updated in place (payload, kind, created_at,
+// protected = strongest of old and new) and its younger same-key rows are deleted. A fresh row is
+// inserted only when none qualifies: no row exists, or every one is in flight, because an in-place
+// update of a row the drainer already holds would be deleted by its ack and lose the newer payload.
+// Keeping the oldest seq matters for order: a repeated boot marker must not jump behind the events
+// enqueued after the first one (node_removed must never be delivered before agent_started).
+// inflightMu orders this against load(), which marks the batch it holds under the same lock.
 func (o *BatchOutbox) enqueueSuperseding(kind string, payload []byte, prot int, key string) (int64, error) {
+	o.inflightMu.Lock()
+	defer o.inflightMu.Unlock()
 	tx, err := o.db.Begin()
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	var oldProt int
-	if err := tx.QueryRow(`SELECT COALESCE(MAX(protected), 0) FROM batch_events WHERE supersede_key = ?`, key).Scan(&oldProt); err != nil {
+	// Take the write lock BEFORE reading. A deferred transaction that reads first and writes later
+	// fails at once with SQLITE_BUSY (busy_timeout does not apply) when another writer commits in
+	// between, i.e. the drainer's delete or fail record; a no-op write here waits on busy_timeout
+	// instead, and the read below then sees the committed state.
+	if _, err := tx.Exec(`UPDATE batch_events SET supersede_key = supersede_key WHERE id = 0`); err != nil {
 		return 0, err
 	}
-	res, err := tx.Exec(`INSERT INTO batch_events (kind, payload, protected, created_at, supersede_key) VALUES (?, ?, ?, ?, ?)`,
-		kind, payload, max(prot, oldProt), o.cfg.Now().Unix(), key)
+	rs, err := tx.Query(`SELECT id, protected FROM batch_events WHERE supersede_key = ? ORDER BY id ASC`, key)
 	if err != nil {
 		return 0, err
 	}
-	id, _ := res.LastInsertId()
-	del, err := tx.Exec(`DELETE FROM batch_events WHERE supersede_key = ? AND id < ?`, key, id)
+	var free []int64 // every same-key row not in flight, oldest first
+	oldProt := 0
+	for rs.Next() {
+		var id int64
+		var p int
+		if err := rs.Scan(&id, &p); err != nil {
+			rs.Close()
+			return 0, err
+		}
+		oldProt = max(oldProt, p)
+		if _, held := o.inflight[id]; !held {
+			free = append(free, id)
+		}
+	}
+	err = rs.Err()
+	rs.Close()
 	if err != nil {
 		return 0, err
+	}
+	now := o.cfg.Now().Unix()
+	var id, replaced int64
+	if len(free) > 0 {
+		res, err := tx.Exec(`UPDATE batch_events SET kind = ?, payload = ?, protected = ?, created_at = ?, attempts = 0, last_error = NULL WHERE id = ?`,
+			kind, payload, max(prot, oldProt), now, free[0])
+		if err != nil {
+			return 0, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			id, replaced = free[0], 1
+		}
+	}
+	if id == 0 {
+		res, err := tx.Exec(`INSERT INTO batch_events (kind, payload, protected, created_at, supersede_key) VALUES (?, ?, ?, ?, ?)`,
+			kind, payload, max(prot, oldProt), now, key)
+		if err != nil {
+			return 0, err
+		}
+		id, _ = res.LastInsertId()
+	}
+	for _, d := range free {
+		if d == id {
+			continue
+		}
+		del, err := tx.Exec(`DELETE FROM batch_events WHERE id = ?`, d)
+		if err != nil {
+			return 0, err
+		}
+		n, _ := del.RowsAffected()
+		replaced += n
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	if n, _ := del.RowsAffected(); n > 0 {
-		o.superseded.Add(n)
+	if replaced > 0 {
+		o.superseded.Add(replaced)
 	}
 	return id, nil
 }
@@ -502,7 +562,9 @@ func (o *BatchOutbox) drain(ctx context.Context) bool {
 			o.noteRecovered()
 			return true
 		}
-		switch o.send(ctx, rows) {
+		res := o.send(ctx, rows)
+		o.release()
+		switch res {
 		case sentOK:
 			o.noteRecovered()
 			o.limit = min(o.cfg.MaxEvents, o.limit*2)
@@ -551,6 +613,13 @@ func (o *BatchOutbox) load() ([]row, error) {
 		return nil, fmt.Errorf("envelope: %w", err)
 	}
 	budget := o.cfg.MaxBytes - len(env) - len(o.cfg.EventsKey) - 16
+	if o.cfg.SupersedeKey != nil {
+		// Hold the lock across the read AND the marking: a superseding enqueue is then either fully
+		// before the read (its payload is what we load) or fully after the mark (it sees the rows as
+		// in flight and inserts instead of updating).
+		o.inflightMu.Lock()
+		defer o.inflightMu.Unlock()
+	}
 	rs, err := o.db.Query(`SELECT id, kind, payload FROM batch_events ORDER BY id ASC LIMIT ?`, o.limit)
 	if err != nil {
 		return nil, err
@@ -570,7 +639,29 @@ func (o *BatchOutbox) load() ([]row, error) {
 		used += cost
 		out = append(out, r)
 	}
-	return out, rs.Err()
+	if err := rs.Err(); err != nil {
+		return nil, err
+	}
+	if o.cfg.SupersedeKey != nil {
+		clear(o.inflight)
+		if o.inflight == nil {
+			o.inflight = make(map[int64]struct{}, len(out))
+		}
+		for _, r := range out {
+			o.inflight[r.id] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+// release forgets the in-flight batch once its send has resolved (acked, kept or dead-lettered).
+func (o *BatchOutbox) release() {
+	if o.cfg.SupersedeKey == nil {
+		return
+	}
+	o.inflightMu.Lock()
+	clear(o.inflight)
+	o.inflightMu.Unlock()
 }
 
 // build assembles the request body, stamping each event's seq.

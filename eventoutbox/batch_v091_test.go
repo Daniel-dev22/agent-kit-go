@@ -305,14 +305,17 @@ func TestSupersedeBoundsRepeatedKeyedEventsToOne(t *testing.T) {
 	for i := 1; i <= 50; i++ {
 		last = enqKind(t, o, "agent_started", i, true)
 	}
-	if got := seqs(t, db); fmt.Sprint(got) != fmt.Sprint([]int64{other, last}) {
-		t.Fatalf("rows = %v, want [%d %d] (one agent_started, the unkeyed event untouched)", got, other, last)
+	if last != a {
+		t.Fatalf("a replacement keeps the oldest seq: got %d, want %d", last, a)
 	}
-	if !(a < other && other < last) {
-		t.Fatalf("seq not monotonic: %d %d %d", a, other, last)
+	if got := seqs(t, db); fmt.Sprint(got) != fmt.Sprint([]int64{a, other}) {
+		t.Fatalf("rows = %v, want [%d %d] (one agent_started, the unkeyed event untouched)", got, a, other)
 	}
-	if o.LastSeq() != last {
-		t.Fatalf("LastSeq = %d, want %d", o.LastSeq(), last)
+	if !(a < other) {
+		t.Fatalf("seq not monotonic: %d %d", a, other)
+	}
+	if o.LastSeq() != other {
+		t.Fatalf("LastSeq = %d, want %d", o.LastSeq(), other)
 	}
 	if st := o.Stats(); st.Superseded != 50 || st.Pending != 2 {
 		t.Fatalf("stats = %+v", st)
@@ -324,12 +327,12 @@ func TestSupersedeBoundsRepeatedKeyedEventsToOne(t *testing.T) {
 	if !o.drain(context.Background()) || rowsLeft(t, db) != 0 {
 		t.Fatal("did not drain")
 	}
-	if fmt.Sprint(c.delivery) != fmt.Sprint([]int64{other, last}) {
+	if fmt.Sprint(c.delivery) != fmt.Sprint([]int64{a, other}) {
 		t.Fatalf("delivery = %v", c.delivery)
 	}
 	// a new keyed event after the queue emptied still gets a higher seq (AUTOINCREMENT, never reused)
-	if n := enqKind(t, o, "agent_started", 99, true); n <= last {
-		t.Fatalf("seq reused: %d <= %d", n, last)
+	if n := enqKind(t, o, "agent_started", 99, true); n <= other {
+		t.Fatalf("seq reused: %d <= %d", n, other)
 	}
 }
 
@@ -597,13 +600,15 @@ func TestEpochConflictOutranksTheBisectAllowlist(t *testing.T) {
 func TestEnqueueSupersedingFailsAtEachStatement(t *testing.T) {
 	for name, setup := range map[string][]string{
 		"select": {`DROP INDEX batch_events_supersede`, `ALTER TABLE batch_events DROP COLUMN supersede_key`},
-		"insert": {`CREATE TRIGGER t BEFORE INSERT ON batch_events BEGIN SELECT RAISE(ABORT, 'boom'); END`},
-		"delete": {`CREATE TRIGGER t BEFORE DELETE ON batch_events BEGIN SELECT RAISE(ABORT, 'boom'); END`},
+		"update": {`CREATE TRIGGER t BEFORE UPDATE ON batch_events BEGIN SELECT RAISE(ABORT, 'boom'); END`},
+		// two unacked same-key rows (a crash-era leftover): the younger one is deleted
+		"delete": {`INSERT INTO batch_events (kind, payload, created_at, supersede_key) VALUES ('agent_started', '{}', 0, 'agent_started')`,
+			`CREATE TRIGGER t BEFORE DELETE ON batch_events BEGIN SELECT RAISE(ABORT, 'boom'); END`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var dead []DeadLetter
 			o, db := newBatchT(t, &ctl{}, supersedeCfg(&dead))
-			enqKind(t, o, "agent_started", 0, true) // so the delete statement has a target
+			enqKind(t, o, "agent_started", 0, true) // so the update/delete statements have a target
 			for _, q := range setup {
 				if _, err := db.Exec(q); err != nil {
 					t.Fatal(err)
