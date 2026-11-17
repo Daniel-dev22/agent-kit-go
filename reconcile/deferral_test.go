@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -93,6 +94,33 @@ func TestDeferralsAreFailuresByDefault(t *testing.T) {
 				t.Fatalf("wait %v failing %v logs %v", wait, r.g.failing, lg.recs)
 			}
 		})
+	}
+}
+
+// After a healthy period a new deferral is a new state change and is logged again: recovery clears
+// the log state even when the agent was never in the failing state.
+func TestDeferralIsLoggedAgainAfterRecovery(t *testing.T) {
+	r := newRig(t, 100*time.Second, 300*time.Second)
+	lg := &levelLog{}
+	r.g.log = slog.New(lg)
+	r.g.cfg.NonErrorDeferrals = true
+	r.fp = "fp1"
+	seq := []string{"ok", "409", "ok", "409"}
+	i := 0
+	r.resp = func(int) (*http.Response, error) {
+		s := seq[i]
+		i++
+		if s == "409" {
+			return reply(409, ``), nil
+		}
+		return reply(200, `{"applied":true}`), nil
+	}
+	for n := range seq {
+		r.fp = fmt.Sprint("fp", n) // a changed fingerprint: every tick posts instead of being gated away
+		r.tick()
+	}
+	if lg.count("INFO reconcile: controller deferred") != 2 || lg.count("INFO reconcile: converged") != 2 {
+		t.Fatalf("logs %v: want 2 deferred and 2 converged lines", lg.recs)
 	}
 }
 
