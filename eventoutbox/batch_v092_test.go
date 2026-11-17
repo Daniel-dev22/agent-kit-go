@@ -269,6 +269,44 @@ func TestSupersedeProtectionIsTheStrongestOfOldAndNewBothWays(t *testing.T) {
 	}
 }
 
+func TestSupersedeNeverInventsProtection(t *testing.T) {
+	var dead []DeadLetter
+	o, db := newBatchT(t, &ctl{}, supersedeCfg(&dead))
+	id := enqKind(t, o, "agent_started", 1, false)
+	if _, p := payloadOf(t, db, id); p != 0 {
+		t.Fatalf("a first unprotected keyed event has protected = %d, want 0", p)
+	}
+	enqKind(t, o, "agent_started", 2, false)
+	if _, p := payloadOf(t, db, id); p != 0 {
+		t.Fatalf("an unprotected replacement of an unprotected row has protected = %d, want 0", p)
+	}
+}
+
+// load marks its batch under inflightMu, so a superseding enqueue is ordered against it.
+func TestLoadTakesTheInFlightLockWhenSupersedeIsOn(t *testing.T) {
+	var dead []DeadLetter
+	o, _ := newBatchT(t, &ctl{}, supersedeCfg(&dead))
+	enqKind(t, o, "agent_started", 1, true)
+	o.inflightMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		_, _ = o.load()
+		close(done)
+	}()
+	select {
+	case <-done:
+		o.inflightMu.Unlock()
+		t.Fatal("load returned while the in-flight lock was held")
+	case <-time.After(150 * time.Millisecond):
+	}
+	o.inflightMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("load did not resume after the lock was released")
+	}
+}
+
 func TestSupersededStatCountsInPlaceReplacementsAndSkipsInFlightInserts(t *testing.T) {
 	var dead []DeadLetter
 	o, _ := newBatchT(t, &ctl{}, supersedeCfg(&dead))
