@@ -16,6 +16,9 @@ batch.go:455:14 cmp >->>= | Add(0) on the superseded counter is a no-op: at repl
 batch.go:505:25 const 0->1 | NewTimer(1ns) vs NewTimer(0): both fire at once; the first drain is not observable as different
 batch.go:675:16 const 2->3 | an envelope is a JSON object: '{}' is 2 bytes and the next shortest object is far longer than 3, so 3 never occurs
 batch.go:687:23 const 2->3 | a stored payload is a JSON object: '{}' is 2 bytes, no valid object is 3 bytes
+batch.go:249:35 cmp >->>= | "len(BisectOnRefusalCodes) >= 0" only adds the empty-list case, where it builds an empty map; a lookup in an empty map and in the nil map it replaces both miss, so no refusal is ever bisected either way
+batch.go:725:18 const 1->0 | max(1, n/2) with n >= 2 (guarded by len(rows) > 1) is n/2 >= 1, so the floor never applies (same argument as 775:18)
+batch.go:759:19 const 1->0 | max(1, n/2) with n >= 2 (guarded by len(rows) > 1) is n/2 >= 1, so the floor never applies (same argument as 775:18)
 batch.go:730:81 cmp >=->> | st == 500 falls to the default arm, which also retries: identical outcome
 batch.go:730:84 const 500->501 | same: 500 reaches the default arm, which retries
 batch.go:733:23 cmp <-><= | 500 is claimed by the earlier >= 500 case, so the 4xx arm never sees it
