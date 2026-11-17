@@ -19,8 +19,8 @@ package eventoutbox
 //   - Delete is exactly the acked ids in one transaction, never id <= max.
 //   - 413 splits the batch (a batch of one is dead-lettered); 429, 5xx, timeouts
 //     and network errors back off with capped exponential full jitter; any other
-//     4xx is a refusal and dead-letters the batch unless the body says
-//     {"retryable":true}.
+//     4xx is a refusal (bisect, then dead-letter) unless the body says
+//     {"retryable":true} or BatchConfig.HoldOnRefusal holds the rows and backs off.
 //   - Bounded by age and rows, drop-oldest, but "protected" events (recovery
 //     events) are only dropped past the hard cap, loudly.
 
@@ -76,6 +76,12 @@ type BatchConfig struct {
 	BackoffBase   time.Duration // default 1s
 	BackoffMax    time.Duration // default 5m
 	PushTimeout   time.Duration // default 15s
+
+	// HoldOnRefusal changes how a non-retryable 4xx (other than 413) on the whole request is
+	// handled. Default false: bisect to the offending event and dead-letter it. True: hold every
+	// row and back off like a 5xx, for controllers whose contract says a request-wide refusal
+	// means "not now" and per-event refusals arrive in a 2xx `rejected` list.
+	HoldOnRefusal bool
 
 	OnDead func(DeadLetter) // called for every event removed undelivered
 	OnSent func()           // called after every 2xx (lets a heartbeat gate count events as traffic)
@@ -499,6 +505,14 @@ func (o *BatchOutbox) send(ctx context.Context, rows []row) outcome {
 		_ = json.Unmarshal(rb, &rt)
 		if rt.Retryable {
 			o.fail(rows, "status", fmt.Errorf("HTTP %d retryable", st))
+			return sentRetry
+		}
+		if o.cfg.HoldOnRefusal {
+			// The controller refused the REQUEST (route missing, state conflict, schema), not
+			// one event: per-event refusals travel in a 2xx `rejected` list. Bisecting or
+			// dead-lettering would destroy events the controller never judged, so keep every
+			// row and back off until the controller can take them.
+			o.fail(rows, "status", fmt.Errorf("HTTP %d refused the whole request (held)", st))
 			return sentRetry
 		}
 		if len(rows) > 1 {
