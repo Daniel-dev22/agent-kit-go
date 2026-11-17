@@ -269,6 +269,42 @@ func TestSupersedeProtectionIsTheStrongestOfOldAndNewBothWays(t *testing.T) {
 	}
 }
 
+// Each failure inside the superseding transaction aborts it whole: an error, no row changed, no
+// supersession counted.
+func TestEnqueueSupersedingFailsAtTheReadInsertAndScan(t *testing.T) {
+	cases := map[string]struct {
+		inflight bool
+		setup    []string
+	}{
+		"query":  {setup: []string{`ALTER TABLE batch_events DROP COLUMN protected`}},
+		"scan":   {setup: []string{`UPDATE batch_events SET protected = 'x'`}},
+		"insert": {inflight: true, setup: []string{`CREATE TRIGGER t BEFORE INSERT ON batch_events BEGIN SELECT RAISE(ABORT, 'boom'); END`}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var dead []DeadLetter
+			o, db := newBatchT(t, &ctl{}, supersedeCfg(&dead))
+			enqKind(t, o, "agent_started", 1, true)
+			if tc.inflight {
+				if _, err := o.load(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, q := range tc.setup {
+				if _, err := db.Exec(q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := o.Enqueue("agent_started", []byte(`{"kind":"agent_started","i":2}`), true); err == nil {
+				t.Fatal("expected an error")
+			}
+			if o.Stats().Superseded != 0 {
+				t.Fatal("a failed transaction must not count a supersession")
+			}
+		})
+	}
+}
+
 func TestSupersedeNeverInventsProtection(t *testing.T) {
 	var dead []DeadLetter
 	o, db := newBatchT(t, &ctl{}, supersedeCfg(&dead))
