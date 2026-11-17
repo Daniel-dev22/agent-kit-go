@@ -23,6 +23,11 @@ package eventoutbox
 //     {"retryable":true} or BatchConfig.HoldOnRefusal holds the rows and backs off.
 //   - Bounded by age and rows, drop-oldest, but "protected" events (recovery
 //     events) are only dropped past the hard cap, loudly.
+//   - Opt-in (zero value = the behaviour above): OnEpochChanged (a 2xx that says
+//     epoch_changed:true is stored, not applied, so it is not an ack), SupersedeKey
+//     (a newer event with the same key replaces its unacked predecessors) and
+//     BisectOnRefusalCodes (with HoldOnRefusal, a refusal code on the allowlist
+//     bisects to the offending event instead of holding the queue).
 
 import (
 	"bytes"
@@ -83,8 +88,37 @@ type BatchConfig struct {
 	// means "not now" and per-event refusals arrive in a 2xx `rejected` list.
 	HoldOnRefusal bool
 
-	OnDead func(DeadLetter) // called for every event removed undelivered
-	OnSent func()           // called after every 2xx (lets a heartbeat gate count events as traffic)
+	// BisectOnRefusalCodes (used only with HoldOnRefusal; default empty = HoldOnRefusal exactly as
+	// before) lists refusal codes, read from the `code` field of the refused reply's body, that
+	// the controller documents as "this request contains an event I will never accept". A
+	// request-wide non-retryable 4xx whose code is on the list is bisected down to the single
+	// event and that event is dead-lettered (contract s4), so one bad event cannot block the head
+	// of the queue. Leave it EMPTY when the controller reports every per-event refusal in a 2xx
+	// `rejected` list (contract v1.7): then every 4xx is an envelope refusal and must never be
+	// listed here. It is keyed on the CODE only: a refusal with any other code (or none) is still
+	// held, because a single-event request that is refused can equally be an envelope refusal
+	// (wrong site, bad schema) and dead-lettering on that would drain the whole queue.
+	BisectOnRefusalCodes []string
+
+	// SupersedeKey (optional) maps an event to a key; "" means no key. Enqueueing an event with a
+	// key deletes every older, still-unacked row with the same key in the same transaction, so a
+	// repeated recovery event (e.g. a boot marker) is bounded to one row. The new row keeps the
+	// strongest protection of the rows it replaces. seq stays monotonic (a new AUTOINCREMENT id;
+	// the removed ids are simply gone, as for any acked row) and FIFO order is untouched. A
+	// replaced row is NOT passed to OnDead (the newer event carries the same fact): it is counted
+	// in BatchStats.Superseded. Setting it adds a nullable supersede_key column to batch_events.
+	SupersedeKey func(kind string, payload []byte) string
+
+	OnDead func(DeadLetter) // called for every event removed undelivered, except those superseded
+	OnSent func()           // called after every acking 2xx (lets a heartbeat gate count events as traffic)
+
+	// OnEpochChanged (optional) is called INSTEAD of OnSent for a 2xx whose body says
+	// epoch_changed:true: the controller stored the events but did not apply them (a straggler
+	// from a non-current epoch), so the reply is not evidence that the controller has this
+	// agent's state, and an agent that publishes a last-ack time must not advance it. The rows are
+	// still deleted (they were stored; a replay would only be a duplicate). Nil keeps OnSent
+	// firing on every 2xx. Counted in BatchStats.EpochChanged either way.
+	OnEpochChanged func()
 
 	Now    func() time.Time // default time.Now
 	Rand   func() float64   // [0,1), default math/rand/v2
@@ -98,6 +132,9 @@ type BatchStats struct {
 	Pending int
 	Dead    int64
 	Dropped int64
+
+	Superseded   int64 // rows replaced under SupersedeKey
+	EpochChanged int64 // acked 2xx replies that said epoch_changed:true
 }
 
 type rejection struct {
@@ -110,6 +147,8 @@ type ack struct {
 	Accepted  *int        `json:"accepted"`
 	Duplicate *int        `json:"duplicate"`
 	Rejected  []rejection `json:"rejected"`
+
+	EpochChanged bool `json:"epoch_changed"`
 }
 
 type row struct {
@@ -134,9 +173,12 @@ type BatchOutbox struct {
 	limit      int // adaptive events-per-request, drainer-owned
 	dead       atomic.Int64
 	dropped    atomic.Int64
-	failing    bool // drainer-owned: logging on state change only
-	conflicted bool // drainer-owned: an epoch conflict is being held (HoldOnRefusal)
-	failures   int  // drainer-owned: consecutive failed passes
+	superseded atomic.Int64
+	epochChg   atomic.Int64
+	bisect     map[string]struct{} // BisectOnRefusalCodes as a set; nil when empty
+	failing    bool                // drainer-owned: logging on state change only
+	conflicted bool                // drainer-owned: an epoch conflict is being held (HoldOnRefusal)
+	failures   int                 // drainer-owned: consecutive failed passes
 }
 
 // NewBatch creates the batch tables on db (idempotent) and returns a BatchOutbox.
@@ -189,10 +231,49 @@ func NewBatch(db *sql.DB, client *http.Client, cfg BatchConfig) (*BatchOutbox, e
 	if err != nil {
 		return nil, err
 	}
-	return &BatchOutbox{
+	if cfg.SupersedeKey != nil {
+		if err := ensureSupersedeColumn(db); err != nil {
+			return nil, err
+		}
+	}
+	o := &BatchOutbox{
 		db: db, client: client, cfg: cfg, epoch: epoch, log: log,
 		poke: make(chan struct{}, 1), stop: make(chan struct{}), limit: cfg.MaxEvents,
-	}, nil
+	}
+	if len(cfg.BisectOnRefusalCodes) > 0 {
+		o.bisect = make(map[string]struct{}, len(cfg.BisectOnRefusalCodes))
+		for _, c := range cfg.BisectOnRefusalCodes {
+			o.bisect[c] = struct{}{}
+		}
+	}
+	return o, nil
+}
+
+// ensureSupersedeColumn adds the supersede_key column and its partial index to an existing
+// batch_events table. It runs only when SupersedeKey is set, so a database that never opts in
+// keeps its schema byte for byte. Idempotent.
+func ensureSupersedeColumn(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("eventoutbox: begin: %w", err)
+	}
+	defer tx.Rollback()
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('batch_events') WHERE name='supersede_key'`).Scan(&n); err != nil {
+		return fmt.Errorf("eventoutbox: inspect batch_events: %w", err)
+	}
+	if n == 0 {
+		if _, err := tx.Exec(`ALTER TABLE batch_events ADD COLUMN supersede_key TEXT`); err != nil {
+			return fmt.Errorf("eventoutbox: add supersede_key: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS batch_events_supersede ON batch_events(supersede_key) WHERE supersede_key IS NOT NULL`); err != nil {
+		return fmt.Errorf("eventoutbox: index supersede_key: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("eventoutbox: commit supersede schema: %w", err)
+	}
+	return nil
 }
 
 // initBatchSchema creates the tables and the epoch in ONE transaction: a DB that
@@ -255,15 +336,64 @@ func (o *BatchOutbox) Enqueue(kind string, payload []byte, protected bool) (int6
 	if protected {
 		prot = 1
 	}
-	res, err := o.db.Exec(`INSERT INTO batch_events (kind, payload, protected, created_at) VALUES (?, ?, ?, ?)`,
-		kind, p, prot, o.cfg.Now().Unix())
+	var id int64
+	var err error
+	if key := o.supersedeKey(kind, p); key != "" {
+		id, err = o.enqueueSuperseding(kind, p, prot, key)
+	} else {
+		var res sql.Result
+		res, err = o.db.Exec(`INSERT INTO batch_events (kind, payload, protected, created_at) VALUES (?, ?, ?, ?)`,
+			kind, p, prot, o.cfg.Now().Unix())
+		if err == nil {
+			id, _ = res.LastInsertId()
+		}
+	}
 	if err != nil {
 		return 0, fmt.Errorf("eventoutbox: enqueue: %w", err)
 	}
-	id, _ := res.LastInsertId()
 	select {
 	case o.poke <- struct{}{}:
 	default:
+	}
+	return id, nil
+}
+
+func (o *BatchOutbox) supersedeKey(kind string, payload []byte) string {
+	if o.cfg.SupersedeKey == nil {
+		return ""
+	}
+	return o.cfg.SupersedeKey(kind, payload)
+}
+
+// enqueueSuperseding inserts the event and deletes its older same-key rows in ONE transaction
+// (one commit), so a crash can never leave both or neither. The new row inherits the strongest
+// protection of the rows it replaces: a protected recovery event is never downgraded by a
+// successor that the caller happened to enqueue unprotected.
+func (o *BatchOutbox) enqueueSuperseding(kind string, payload []byte, prot int, key string) (int64, error) {
+	tx, err := o.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var oldProt int
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(protected), 0) FROM batch_events WHERE supersede_key = ?`, key).Scan(&oldProt); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`INSERT INTO batch_events (kind, payload, protected, created_at, supersede_key) VALUES (?, ?, ?, ?, ?)`,
+		kind, payload, max(prot, oldProt), o.cfg.Now().Unix(), key)
+	if err != nil {
+		return 0, err
+	}
+	id, _ := res.LastInsertId()
+	del, err := tx.Exec(`DELETE FROM batch_events WHERE supersede_key = ? AND id < ?`, key, id)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	if n, _ := del.RowsAffected(); n > 0 {
+		o.superseded.Add(n)
 	}
 	return id, nil
 }
@@ -293,7 +423,8 @@ func (o *BatchOutbox) LastSeq() int64 {
 func (o *BatchOutbox) Stats() BatchStats {
 	var n int
 	_ = o.db.QueryRow(`SELECT COUNT(*) FROM batch_events`).Scan(&n)
-	return BatchStats{Epoch: o.epoch, LastSeq: o.LastSeq(), Pending: n, Dead: o.dead.Load(), Dropped: o.dropped.Load()}
+	return BatchStats{Epoch: o.epoch, LastSeq: o.LastSeq(), Pending: n, Dead: o.dead.Load(), Dropped: o.dropped.Load(),
+		Superseded: o.superseded.Load(), EpochChanged: o.epochChg.Load()}
 }
 
 // Start runs the single drain goroutine until ctx is cancelled or Close is called.
@@ -316,8 +447,11 @@ func (o *BatchOutbox) loop(ctx context.Context) {
 	backingOff := false
 	for {
 		pk := o.poke
-		if backingOff {
-			pk = nil // a poke must not cut a backoff short: that is the herd
+		if backingOff || o.conflicted {
+			// A poke must not cut a backoff short (that is the herd), and while the controller
+			// reports an epoch conflict another request would only be refused again: retry on the
+			// normal DrainInterval cadence, not once per Enqueue.
+			pk = nil
 		}
 		select {
 		case <-ctx.Done():
@@ -526,6 +660,17 @@ func (o *BatchOutbox) send(ctx context.Context, rows []row) outcome {
 			}
 			return sentConflict
 		}
+		if _, ok := o.bisect[rt.Code]; ok && o.cfg.HoldOnRefusal && rt.Code != "" {
+			// The controller says this code means "an event in here is never acceptable"
+			// (BisectOnRefusalCodes): isolate it. Keyed on the code, never on a single-event
+			// request still being refused (that can be an envelope refusal).
+			if len(rows) > 1 {
+				o.limit = max(1, len(rows)/2)
+				return sentSplit
+			}
+			o.deadLetter(rows, rt.Code, fmt.Sprintf("HTTP %d", st))
+			return sentDead
+		}
 		if o.cfg.HoldOnRefusal {
 			// The controller refused the REQUEST (route missing, state conflict, schema), not
 			// one event: per-event refusals travel in a 2xx `rejected` list. Bisecting or
@@ -601,7 +746,15 @@ func (o *BatchOutbox) onAck(rows []row, rb []byte) outcome {
 	for _, r := range terminal {
 		o.noteDead(DeadLetter{Seq: r.id, Kind: r.kind, Code: reasons[r.id], Reason: "refused by controller"})
 	}
-	if o.cfg.OnSent != nil {
+	switch {
+	case a.EpochChanged:
+		o.epochChg.Add(1)
+		if o.cfg.OnEpochChanged != nil {
+			o.cfg.OnEpochChanged() // stored, not applied: not an ack, OnSent must not fire
+		} else if o.cfg.OnSent != nil {
+			o.cfg.OnSent()
+		}
+	case o.cfg.OnSent != nil:
 		o.cfg.OnSent()
 	}
 	if len(retry) > 0 {
@@ -618,7 +771,13 @@ func (o *BatchOutbox) onAck(rows []row, rb []byte) outcome {
 }
 
 func (o *BatchOutbox) deleteIDs(ids []int64) error {
-	if len(ids) == 0 {
+	return o.execEach(`DELETE FROM batch_events WHERE id = ?`, len(ids), func(i int) []any { return []any{ids[i]} })
+}
+
+// execEach runs query once per index in ONE transaction (one commit, one fsync), so a pass over
+// up to MaxEvents rows costs a single write barrier rather than one per row.
+func (o *BatchOutbox) execEach(query string, n int, args func(i int) []any) error {
+	if n == 0 {
 		return nil
 	}
 	tx, err := o.db.Begin()
@@ -626,26 +785,27 @@ func (o *BatchOutbox) deleteIDs(ids []int64) error {
 		return err
 	}
 	defer tx.Rollback()
-	st, err := tx.Prepare(`DELETE FROM batch_events WHERE id = ?`)
+	st, err := tx.Prepare(query)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	for _, id := range ids {
-		if _, err := st.Exec(id); err != nil {
+	for i := range n {
+		if _, err := st.Exec(args(i)...); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
+// fail records one failed pass: ONE transaction for all rows and, if even that fails, ONE log
+// line carrying the row count (not one line and one autocommit fsync per row).
 func (o *BatchOutbox) fail(rows []row, stage string, err error) {
 	o.noteFailure(stage, err)
-	for _, r := range rows {
-		if _, e := o.db.Exec(`UPDATE batch_events SET attempts = attempts + 1, last_error = ? WHERE id = ?`,
-			err.Error(), r.id); e != nil {
-			o.log.Warn("eventoutbox: record failure failed", "error", e, "seq", r.id)
-		}
+	msg := err.Error()
+	if e := o.execEach(`UPDATE batch_events SET attempts = attempts + 1, last_error = ? WHERE id = ?`,
+		len(rows), func(i int) []any { return []any{msg, rows[i].id} }); e != nil {
+		o.log.Warn("eventoutbox: record failure failed", "error", e, "rows", len(rows))
 	}
 }
 

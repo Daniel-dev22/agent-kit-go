@@ -1,22 +1,24 @@
 # Mutants of eventoutbox that survive because they are equivalent, each with the argument.
 # cmd/mutate refuses a survivor with no reason and any survivor not listed here.
 # batch.go (this extension)
-batch.go:248:14 const 2->1 | a payload of length 1 is rejected by the p[0]/p[len-1] checks anyway ('{' is not '}'); length 0 fails the same way
-batch.go:314:25 const 0->1 | NewTimer(1ns) vs NewTimer(0): both fire at once; the first drain is not observable as different
-batch.go:450:16 const 2->3 | an envelope is a JSON object: '{}' is 2 bytes and the next shortest object is far longer than 3, so 3 never occurs
-batch.go:462:23 const 2->3 | a stored payload is a JSON object: '{}' is 2 bytes, no valid object is 3 bytes
-batch.go:500:18 const 1->0 | max(1, n/2) with n >= 2 (guarded by len(rows) > 1) is n/2 >= 1, so the floor never applies
-batch.go:505:81 cmp >=->> | st == 500 falls to the default arm, which also retries: identical outcome
-batch.go:505:84 const 500->501 | same: 500 reaches the default arm, which retries
-batch.go:508:23 cmp <-><= | 500 is claimed by the earlier >= 500 case, so the 4xx arm never sees it
-batch.go:508:25 const 500->501 | same
-batch.go:679:63 const 1->2 | the limit argument is a sentinel: any negative number means no LIMIT clause
-batch.go:681:7 cmp >->>= | at n == MaxRows the drop count n-MaxRows is 0 and the query is LIMIT 0: nothing is dropped either way
-batch.go:539:18 const 1->0 | max(1, n/2) with n >= 2 (guarded by len(rows) > 1) is n/2 >= 1, so the floor never applies
-batch.go:633:2 defer Close removed | the statement is prepared on a transaction; Commit and Rollback close it, so the explicit Close is redundant
-batch.go:684:22 cmp >->>= | at n == MaxRows or HardRows the drop count n-bound is 0 and the query is LIMIT 0: nothing is dropped either way
-batch.go:697:11 cmp >=->> | limit is either the -1 sentinel or >= 1 (a drop count is only requested when positive), so >= 0 and > 0 agree
-batch.go:697:14 const 0->1 | same
+batch.go:243:35 cmp >->>= | an empty allowlist builds an empty map instead of nil; a lookup misses either way
+batch.go:329:14 const 2->1 | a payload of length 1 is rejected by the p[0]/p[len-1] checks anyway ('{' is not '}'); length 0 fails the same way
+batch.go:375:10 const 0->1 | the id returned alongside an error is discarded: Enqueue returns 0 and the wrapped error
+batch.go:380:10 const 0->1 | same
+batch.go:385:10 const 0->1 | same
+batch.go:390:10 const 0->1 | same
+batch.go:393:10 const 0->1 | same
+batch.go:395:35 cmp >->>= | Add(0) on the superseded counter is a no-op: at n == 0 both forms leave it unchanged
+batch.go:445:25 const 0->1 | NewTimer(1ns) vs NewTimer(0): both fire at once; the first drain is not observable as different
+batch.go:584:16 const 2->3 | an envelope is a JSON object: '{}' is 2 bytes and the next shortest object is far longer than 3, so 3 never occurs
+batch.go:596:23 const 2->3 | a stored payload is a JSON object: '{}' is 2 bytes, no valid object is 3 bytes
+batch.go:668:19 const 1->0 | max(1, n/2) with n >= 2 (guarded by len(rows) > 1) is n/2 >= 1, so the floor never applies
+batch.go:684:18 const 1->0 | max(1, n/2) with n >= 2 (guarded by len(rows) > 1) is n/2 >= 1, so the floor never applies
+batch.go:792:2 defer Close removed | the statement is prepared on a transaction; Commit and Rollback close it, so the explicit Close is redundant
+batch.go:841:7 cmp >->>= | at n == MaxRows the drop count n-MaxRows is 0 and the query is LIMIT 0: nothing is dropped either way
+batch.go:844:22 cmp >->>= | at n == MaxRows or HardRows the drop count n-bound is 0 and the query is LIMIT 0: nothing is dropped either way
+batch.go:857:11 cmp >=->> | limit is either the -1 sentinel or >= 1 (a drop count is only requested when positive), so >= 0 and > 0 agree
+batch.go:857:14 const 0->1 | same
 # outbox.go (pre-existing path, NOT modified by the batch extension; its wire bytes are pinned by TestGoldenWireEnqueuePush)
 outbox.go:32:25 const 5->6 | push timeout: observing 5s vs 6s needs a hung server and a multi-second test for a constant nobody changes
 outbox.go:32:25 const 5->4 | same
