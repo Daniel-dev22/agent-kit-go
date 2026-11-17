@@ -388,6 +388,13 @@ func (o *BatchOutbox) enqueueSuperseding(kind string, payload []byte, prot int, 
 		return 0, err
 	}
 	defer tx.Rollback()
+	// Take the write lock BEFORE reading. A deferred transaction that reads first and writes later
+	// fails at once with SQLITE_BUSY (busy_timeout does not apply) when another writer commits in
+	// between, i.e. the drainer's delete or fail record; a no-op write here waits on busy_timeout
+	// instead, and the read below then sees the committed state.
+	if _, err := tx.Exec(`UPDATE batch_events SET supersede_key = supersede_key WHERE id = 0`); err != nil {
+		return 0, err
+	}
 	rs, err := tx.Query(`SELECT id, protected FROM batch_events WHERE supersede_key = ? ORDER BY id ASC`, key)
 	if err != nil {
 		return 0, err

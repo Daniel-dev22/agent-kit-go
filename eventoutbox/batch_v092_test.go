@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 )
 
 // A superseding enqueue keeps the OLDEST seq of its key, so a repeated boot marker never jumps
@@ -85,6 +87,89 @@ func TestSupersedeReplacementDuringAnInFlightSendIsNotLost(t *testing.T) {
 	}
 	if rowsLeft(t, db) != 0 {
 		t.Fatal("queue should be empty")
+	}
+}
+
+// The replacement arrives while the send is in flight and that send then FAILS: the in-flight row
+// must still be there to retry (it was never superseded), next to the newer one, in order.
+func TestSupersedeInFlightRowSurvivesAFailedSend(t *testing.T) {
+	var dead []DeadLetter
+	var order []string
+	var o *BatchOutbox
+	var replacement int64
+	failed := false
+	rec := recordOrder(&order)
+	c := &ctl{}
+	c.respond = func(c *ctl, w http.ResponseWriter, evs []map[string]any) bool {
+		if !failed {
+			failed = true
+			replacement = enqKind(t, o, "agent_started", 2, true)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return true
+		}
+		return rec(c, w, evs)
+	}
+	var db *sql.DB
+	o, db = newBatchT(t, c, supersedeCfg(&dead))
+	first := enqKind(t, o, "agent_started", 1, true)
+	if o.drain(context.Background()) {
+		t.Fatal("a 503 must back off")
+	}
+	if got := seqs(t, db); fmt.Sprint(got) != fmt.Sprint([]int64{first, replacement}) {
+		t.Fatalf("rows after the failed send = %v, want the in-flight %d and the replacement %d", got, first, replacement)
+	}
+	if !o.drain(context.Background()) || rowsLeft(t, db) != 0 {
+		t.Fatal("retry did not drain")
+	}
+	if fmt.Sprint(order) != "[agent_started:1 agent_started:2]" {
+		t.Fatalf("delivered %v, want old then newest, once each", order)
+	}
+}
+
+// Real concurrency (run under -race): a stream of replacements racing the live drainer never loses
+// the newest payload and never delivers a key's events out of order.
+func TestSupersedeConcurrentEnqueueAgainstTheLiveDrainer(t *testing.T) {
+	var dead []DeadLetter
+	var order []string
+	c := &ctl{respond: recordOrder(&order)}
+	o, db := newBatchT(t, c, supersedeCfg(&dead))
+	o.Start(context.Background())
+	t.Cleanup(o.Close)
+	const n = 200
+	for i := 1; i <= n; i++ {
+		enqKind(t, o, "agent_started", i, true)
+		if i%50 == 0 {
+			enqKind(t, o, "node_removed", i, true)
+		}
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for rowsLeft(t, db) != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if rowsLeft(t, db) != 0 {
+		t.Fatalf("queue not drained: %d left", rowsLeft(t, db))
+	}
+	last, prev := 0, 0
+	for _, s := range order {
+		var kind string
+		var i int
+		if _, err := fmt.Sscanf(strings.Replace(s, ":", " ", 1), "%s %d", &kind, &i); err != nil {
+			t.Fatal(err)
+		}
+		if kind == "agent_started" {
+			if i <= prev {
+				t.Fatalf("agent_started payloads delivered out of order: %d after %d", i, prev)
+			}
+			prev, last = i, i
+		}
+	}
+	if last != n {
+		t.Fatalf("newest agent_started payload delivered = %d, want %d (lost under a race)", last, n)
+	}
+	if order[0][:13] != "agent_started" {
+		t.Fatalf("first delivered = %s, want agent_started", order[0])
 	}
 }
 
