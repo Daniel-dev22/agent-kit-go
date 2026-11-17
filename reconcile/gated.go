@@ -128,6 +128,7 @@ type Gated struct {
 
 	failures     int
 	failing      bool
+	buildFailing bool   // Build is failing: logged on the edge only, not every tick
 	healthy      bool   // first-success confirmation logged
 	deferredWhat string // the deferral being logged (NonErrorDeferrals), "" when none
 }
@@ -192,13 +193,24 @@ func (g *Gated) Run(ctx context.Context) {
 	}
 }
 
+// noteBuild logs a Build failure on the edge only (first failure at Warn, recovery at Info): a
+// builder that fails for hours (a failing volume) must not write one line per tick.
+func (g *Gated) noteBuild(err error) {
+	switch {
+	case err != nil && !g.buildFailing:
+		g.buildFailing = true
+		g.log.Warn("reconcile: build failed; sending full snapshot if one can be built", "error", err)
+	case err == nil && g.buildFailing:
+		g.buildFailing = false
+		g.log.Info("reconcile: build recovered")
+	}
+}
+
 // Tick runs one gated cycle and returns how long to wait before the next.
 func (g *Gated) Tick(ctx context.Context) time.Duration {
 	fr, err := g.cfg.Build(ctx)
 	fpOK := err == nil
-	if err != nil {
-		g.log.Warn("reconcile: build failed; sending full snapshot if one can be built", "error", err)
-	}
+	g.noteBuild(err)
 	g.mu.Lock()
 	act := g.gate.Decide(g.cfg.Now(), fr.Fingerprint, fpOK)
 	g.mu.Unlock()
