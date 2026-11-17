@@ -1,6 +1,6 @@
 # Mutants of reconcile that survive, each with the argument. cmd/mutate refuses a survivor with no reason.
 # gated.go (this extension)
-gated.go:146:18 cmp >->>= | Interval > MaxSilence vs >=: when they are equal the assignment writes the same value
+gated.go:147:18 cmp >->>= | Interval > MaxSilence vs >=: when they are equal the assignment writes the same value
 # reconcile.go (pre-existing Run path, NOT modified by the gated extension; its wire bytes are pinned by TestGoldenWireRunSnapshot)
 reconcile.go:81:17 const 0->1 | Interval <= 1 vs <= 0: a 1ns interval is a spin loop, not a configuration anyone can test
 reconcile.go:86:41 cmp !=->== | legacy: only selects a log line after the first push

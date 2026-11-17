@@ -553,7 +553,9 @@ func TestLoopBurstIsFewPostsAndPokeDuringBackoffIsIgnored(t *testing.T) {
 		return false
 	}}
 	o, db := newBatchT(t, c, func(cfg *BatchConfig) {
-		cfg.BackoffBase, cfg.BackoffMax = 400*time.Millisecond, 400*time.Millisecond
+		// 1.5 s, not 400 ms: 20 fsynced enqueues on a loaded host can outlast a short backoff
+		// and turn "a poke cut the backoff short" into a false report (seen at baseline v0.9.0).
+		cfg.BackoffBase, cfg.BackoffMax = 1500*time.Millisecond, 1500*time.Millisecond
 		cfg.DrainInterval = time.Hour
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -573,7 +575,7 @@ func TestLoopBurstIsFewPostsAndPokeDuringBackoffIsIgnored(t *testing.T) {
 	mu.Lock()
 	fail = false
 	mu.Unlock()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(6 * time.Second)
 	for time.Now().Before(deadline) && rowsLeft(t, db) != 0 {
 		time.Sleep(20 * time.Millisecond)
 	}
