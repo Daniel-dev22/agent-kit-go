@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -56,6 +57,13 @@ type GatedConfig struct {
 	// 64 KiB). Replies that fail to parse, non-2xx replies and transport errors never call it.
 	// Optional: nil keeps the existing behaviour byte for byte.
 	OnReply func(body []byte)
+
+	// NonErrorDeferrals makes two controller replies a deferral instead of a failure (contract
+	// v1.6): HTTP 409 (another process holds this identity) and a 2xx with applied:false. A deferral
+	// forces a full snapshot on the next tick, logs once per state change at Info, does not back
+	// off and does not count as a failure, so the heartbeat cadence continues. Default false keeps
+	// today's behaviour byte for byte (both are retried with backoff and logged at Warn).
+	NonErrorDeferrals bool
 
 	Now    func() time.Time
 	Rand   func() float64
@@ -118,9 +126,10 @@ type Gated struct {
 	mu   sync.Mutex
 	gate *Gate
 
-	failures int
-	failing  bool
-	healthy  bool // first-success confirmation logged
+	failures     int
+	failing      bool
+	healthy      bool   // first-success confirmation logged
+	deferredWhat string // the deferral being logged (NonErrorDeferrals), "" when none
 }
 
 // NewGated validates and defaults cfg.
@@ -207,6 +216,9 @@ func (g *Gated) Tick(ctx context.Context) time.Duration {
 		return g.failWait()
 	}
 	applied, want, err := g.post(ctx, body)
+	if errors.Is(err, errConflict) || errors.Is(err, errNotApplied) {
+		return g.deferred(err)
+	}
 	now := g.cfg.Now()
 	g.mu.Lock()
 	switch {
@@ -232,9 +244,9 @@ func (g *Gated) Tick(ctx context.Context) time.Duration {
 		}
 		return g.failWait()
 	}
-	if g.failing || !g.healthy {
+	if g.failing || !g.healthy || g.deferredWhat != "" {
 		g.log.Info("reconcile: converged with controller", "action", act)
-		g.failing, g.healthy = false, true
+		g.failing, g.healthy, g.deferredWhat = false, true, ""
 	}
 	g.failures = 0
 	return g.nextInterval()
@@ -266,6 +278,9 @@ func (g *Gated) post(ctx context.Context, body []byte) (applied, want bool, err 
 	}
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode == http.StatusConflict && g.cfg.NonErrorDeferrals {
+		return false, false, errConflict
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return false, false, fmt.Errorf("controller returned %d: %.200s", resp.StatusCode, rb)
 	}
@@ -279,5 +294,35 @@ func (g *Gated) post(ctx context.Context, body []byte) (applied, want bool, err 
 	if g.cfg.OnReply != nil {
 		g.cfg.OnReply(rb)
 	}
+	if !*r.Applied && g.cfg.NonErrorDeferrals {
+		return false, r.Want, errNotApplied
+	}
 	return *r.Applied, r.Want, nil
+}
+
+// errConflict and errNotApplied are post's two deferral outcomes (NonErrorDeferrals only).
+var (
+	errConflict   = errors.New("reconcile: 409 conflict")
+	errNotApplied = errors.New("reconcile: applied:false")
+)
+
+// deferred handles a controller deferral: the controller is reachable and answering, it just asks
+// for a snapshot (applied:false) or has another process holding the identity (409 conflict). That
+// is not a failure: no backoff, no failure count, one Info line per state change, the next tick on
+// the normal cadence with a full snapshot forced, so a heartbeat keeps flowing and a takeover is
+// seen as soon as the other process goes quiet.
+func (g *Gated) deferred(err error) time.Duration {
+	what := "applied:false"
+	if errors.Is(err, errConflict) {
+		what = "409 conflict"
+	}
+	g.mu.Lock()
+	g.gate.WantSnapshot()
+	g.mu.Unlock()
+	if g.deferredWhat != what {
+		g.deferredWhat = what
+		g.log.Info("reconcile: controller deferred the message (not an error)", "reply", what)
+	}
+	g.failures = 0
+	return g.nextInterval()
 }

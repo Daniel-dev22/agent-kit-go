@@ -19,8 +19,8 @@ package eventoutbox
 //   - Delete is exactly the acked ids in one transaction, never id <= max.
 //   - 413 splits the batch (a batch of one is dead-lettered); 429, 5xx, timeouts
 //     and network errors back off with capped exponential full jitter; any other
-//     4xx is a refusal and dead-letters the batch unless the body says
-//     {"retryable":true}.
+//     4xx is a refusal (bisect, then dead-letter) unless the body says
+//     {"retryable":true} or BatchConfig.HoldOnRefusal holds the rows and backs off.
 //   - Bounded by age and rows, drop-oldest, but "protected" events (recovery
 //     events) are only dropped past the hard cap, loudly.
 
@@ -77,6 +77,12 @@ type BatchConfig struct {
 	BackoffMax    time.Duration // default 5m
 	PushTimeout   time.Duration // default 15s
 
+	// HoldOnRefusal changes how a non-retryable 4xx (other than 413) on the whole request is
+	// handled. Default false: bisect to the offending event and dead-letter it. True: hold every
+	// row and back off like a 5xx, for controllers whose contract says a request-wide refusal
+	// means "not now" and per-event refusals arrive in a 2xx `rejected` list.
+	HoldOnRefusal bool
+
 	OnDead func(DeadLetter) // called for every event removed undelivered
 	OnSent func()           // called after every 2xx (lets a heartbeat gate count events as traffic)
 
@@ -125,11 +131,12 @@ type BatchOutbox struct {
 	once sync.Once
 	wg   sync.WaitGroup
 
-	limit    int // adaptive events-per-request, drainer-owned
-	dead     atomic.Int64
-	dropped  atomic.Int64
-	failing  bool // drainer-owned: logging on state change only
-	failures int  // drainer-owned: consecutive failed passes
+	limit      int // adaptive events-per-request, drainer-owned
+	dead       atomic.Int64
+	dropped    atomic.Int64
+	failing    bool // drainer-owned: logging on state change only
+	conflicted bool // drainer-owned: an epoch conflict is being held (HoldOnRefusal)
+	failures   int  // drainer-owned: consecutive failed passes
 }
 
 // NewBatch creates the batch tables on db (idempotent) and returns a BatchOutbox.
@@ -369,6 +376,8 @@ func (o *BatchOutbox) drain(ctx context.Context) bool {
 			// no backoff; the limit already shrank (split) or must not grow (nothing was delivered)
 		case sentRetry:
 			return false
+		case sentConflict:
+			return true // rows kept; the next pass is one DrainInterval away, not a backoff
 		}
 	}
 }
@@ -380,6 +389,7 @@ const (
 	sentSplit
 	sentDead
 	sentRetry
+	sentConflict // HoldOnRefusal: epoch_conflict; rows kept, no backoff
 )
 
 func (o *BatchOutbox) noteFailure(what string, err error) {
@@ -390,6 +400,10 @@ func (o *BatchOutbox) noteFailure(what string, err error) {
 }
 
 func (o *BatchOutbox) noteRecovered() {
+	if o.conflicted {
+		o.conflicted = false
+		o.log.Info("eventoutbox: epoch conflict cleared")
+	}
 	if o.failing {
 		o.failing = false
 		o.log.Info("eventoutbox: batch push recovered")
@@ -499,6 +513,25 @@ func (o *BatchOutbox) send(ctx context.Context, rows []row) outcome {
 		_ = json.Unmarshal(rb, &rt)
 		if rt.Retryable {
 			o.fail(rows, "status", fmt.Errorf("HTTP %d retryable", st))
+			return sentRetry
+		}
+		if o.cfg.HoldOnRefusal && st == http.StatusConflict && rt.Code == "epoch_conflict" {
+			// Another process holds this identity (contract v1.6): not an error to alarm on and not
+			// worth an exponential climb. Keep every row, log once per state change at Info and
+			// look again on the normal drain cadence, so a takeover is seen as soon as the other
+			// process goes quiet.
+			if !o.conflicted {
+				o.conflicted = true
+				o.log.Info("eventoutbox: controller reports an epoch conflict (events held, not an error)")
+			}
+			return sentConflict
+		}
+		if o.cfg.HoldOnRefusal {
+			// The controller refused the REQUEST (route missing, state conflict, schema), not
+			// one event: per-event refusals travel in a 2xx `rejected` list. Bisecting or
+			// dead-lettering would destroy events the controller never judged, so keep every
+			// row and back off until the controller can take them.
+			o.fail(rows, "status", fmt.Errorf("HTTP %d refused the whole request (held)", st))
 			return sentRetry
 		}
 		if len(rows) > 1 {
