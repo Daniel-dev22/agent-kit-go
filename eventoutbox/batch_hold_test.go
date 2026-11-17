@@ -106,6 +106,55 @@ func TestHoldOnRefusalDeliversEverythingOnceTheControllerRecovers(t *testing.T) 
 	}
 }
 
+// Contract v1.6: 409 epoch_conflict is a non-error. Rows are kept (no bisect, no dead letter), the
+// drain does NOT back off (it reports ok so the loop waits one DrainInterval), the first conflict is
+// logged once at Info, and delivery resumes the moment the controller accepts.
+func TestHoldOnRefusalEpochConflictIsANonErrorAndRecovers(t *testing.T) {
+	conflict := true
+	c := &ctl{respond: func(_ *ctl, w http.ResponseWriter, _ []map[string]any) bool {
+		if conflict {
+			w.WriteHeader(409)
+			io.WriteString(w, `{"code":"epoch_conflict"}`)
+			return true
+		}
+		return false
+	}}
+	var dead []DeadLetter
+	o, db := newBatchT(t, c, holdCfg(&dead))
+	enq(t, o, 3, false)
+	for i := 0; i < 3; i++ {
+		if !o.drain(context.Background()) {
+			t.Fatal("a conflict must not be reported as a failure to back off from")
+		}
+	}
+	if rowsLeft(t, db) != 3 || len(dead) != 0 || c.posts != 3 || o.failing || !o.conflicted {
+		t.Fatalf("rows=%d dead=%d posts=%d failing=%v conflicted=%v", rowsLeft(t, db), len(dead), c.posts, o.failing, o.conflicted)
+	}
+	d, back := o.afterPass(true)
+	if d != o.cfg.DrainInterval || back {
+		t.Fatalf("after a conflict the next pass is %v away (backingOff=%v), want the DrainInterval", d, back)
+	}
+	conflict = false
+	if !o.drain(context.Background()) || rowsLeft(t, db) != 0 || o.conflicted {
+		t.Fatal("delivery did not resume after the conflict cleared")
+	}
+}
+
+// Without HoldOnRefusal a 409 epoch_conflict is still the old refusal (bisect then dead-letter).
+func TestEpochConflictWithoutHoldKeepsTheDefaultBehaviour(t *testing.T) {
+	c := &ctl{respond: func(_ *ctl, w http.ResponseWriter, _ []map[string]any) bool {
+		w.WriteHeader(409)
+		io.WriteString(w, `{"code":"epoch_conflict"}`)
+		return true
+	}}
+	var dead []DeadLetter
+	o, db := newBatchT(t, c, func(cfg *BatchConfig) { cfg.OnDead = func(d DeadLetter) { dead = append(dead, d) } })
+	enq(t, o, 2, false)
+	if !o.drain(context.Background()) || rowsLeft(t, db) != 0 || len(dead) != 2 {
+		t.Fatalf("default behaviour changed: rows=%d dead=%d", rowsLeft(t, db), len(dead))
+	}
+}
+
 // The loop obeys the backoff for a held refusal (a poke must not cut it short: that is the herd).
 func TestHoldOnRefusalBacksOffInTheLoop(t *testing.T) {
 	c := &ctl{respond: func(_ *ctl, w http.ResponseWriter, _ []map[string]any) bool {
