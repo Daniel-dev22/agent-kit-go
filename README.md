@@ -85,7 +85,10 @@ require github.com/Daniel-dev22/agent-kit-go v0.3.0
 go test ./...
 ```
 
-Hermetic — no network, no build tags, no environment gates. 13 test files, 44 tests. `jobstore` and
+Hermetic — no network, no build tags, no environment gates, with two deliberate exceptions in
+`dirsize`: `mountguard_live_test.go` runs the mount guard against the host's real
+`/proc/self/mountinfo` and sysfs (asserting only invariants true on any Linux host, skipped where
+there is no mountinfo), and the unreadable-directory test skips when run as root. `jobstore` and
 `eventoutbox` run against a real in-memory SQLite via the pure-Go `modernc.org/sqlite` driver, so
 the SQL is genuinely executed rather than mocked out.
 

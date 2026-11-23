@@ -124,7 +124,7 @@ func TestDirSizeWalkReusesNotDue(t *testing.T) {
 
 	// Seed `sub` with a fresh, deliberately-wrong cached total. Because it's
 	// within the small cadence window, the parent walk must reuse it verbatim.
-	cache.put(sub, Entry{Bytes: 999, FileCount: 7, ComputedAtS: time.Now().Unix()})
+	cache.Put(sub, Entry{Bytes: 999, FileCount: 7, ComputedAtS: time.Now().Unix()})
 
 	gotB, gotC, _, err := g.walk(context.Background(), root, 0)
 	if err != nil {
@@ -162,15 +162,15 @@ func TestDirSizeDue(t *testing.T) {
 	if !g.due("/never/computed", now) {
 		t.Error("uncached path should be due")
 	}
-	cache.put("/fresh", Entry{FileCount: 10, ComputedAtS: now.Unix()})
+	cache.Put("/fresh", Entry{FileCount: 10, ComputedAtS: now.Unix()})
 	if g.due("/fresh", now) {
 		t.Error("freshly computed small dir should not be due")
 	}
-	cache.put("/stale", Entry{FileCount: 10, ComputedAtS: now.Add(-7 * time.Hour).Unix()})
+	cache.Put("/stale", Entry{FileCount: 10, ComputedAtS: now.Add(-7 * time.Hour).Unix()})
 	if !g.due("/stale", now) {
 		t.Error("small dir older than 6h should be due")
 	}
-	cache.put("/bigrecent", Entry{FileCount: 60000, ComputedAtS: now.Add(-7 * time.Hour).Unix()})
+	cache.Put("/bigrecent", Entry{FileCount: 60000, ComputedAtS: now.Add(-7 * time.Hour).Unix()})
 	if g.due("/bigrecent", now) {
 		t.Error("large dir within 24h should not be due")
 	}
@@ -179,8 +179,8 @@ func TestDirSizeDue(t *testing.T) {
 func TestDirSizeCachePersistRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	c := newTestCache(dir)
-	c.put("/a", Entry{Bytes: 100, FileCount: 3, ComputedAtS: time.Now().Unix()})
-	c.put("/b", Entry{Bytes: 200, FileCount: 9, ComputedAtS: time.Now().Unix()})
+	c.Put("/a", Entry{Bytes: 100, FileCount: 3, ComputedAtS: time.Now().Unix()})
+	c.Put("/b", Entry{Bytes: 200, FileCount: 9, ComputedAtS: time.Now().Unix()})
 	if err := c.save(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -240,9 +240,9 @@ func TestSizeGathererExcludePaths(t *testing.T) {
 
 func TestDirSizeCachePrune(t *testing.T) {
 	c := newTestCache(t.TempDir())
-	c.put("/keep/a", Entry{Bytes: 1})
-	c.put("/var/lib/rancher/k3s", Entry{Bytes: 2})
-	c.put("/var/lib/rancher/k3s/agent/x", Entry{Bytes: 3})
+	c.Put("/keep/a", Entry{Bytes: 1})
+	c.Put("/var/lib/rancher/k3s", Entry{Bytes: 2})
+	c.Put("/var/lib/rancher/k3s/agent/x", Entry{Bytes: 3})
 
 	if n := c.prune([]string{"/var/lib/rancher/k3s"}); n != 2 {
 		t.Errorf("prune removed %d, want 2", n)

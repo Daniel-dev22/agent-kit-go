@@ -62,7 +62,7 @@ type Gatherer struct {
 	// orphaned dm targets) so the walk never descends into one. Rebuilt at the
 	// start of every pass because the mount table changes between passes — that is
 	// the whole point, an image build can leak a mount at any time. Nil is safe and
-	// means "no mount is skipped"; see runPass for why that degradation is correct.
+	// means "no mount is skipped"; see RunPass for why that degradation is correct.
 	guard *MountGuard
 	// lastGuardSig is the previous pass's skip set, so the summary logs on change
 	// rather than every pass.
@@ -179,7 +179,7 @@ func (g *Gatherer) loop(ctx context.Context) {
 		"large_file_threshold", g.opts.LargeFileThreshold)
 
 	for {
-		g.runPass(ctx)
+		g.RunPass(ctx)
 		select {
 		case <-ctx.Done():
 			return
@@ -215,8 +215,6 @@ func (g *Gatherer) untilNextDue(now time.Time) time.Duration {
 	return d
 }
 
-// runPass walks each due root once, bottom-up, refreshing due directories and
-// reusing cached totals for not-due subtrees. Persists after each root.
 // persist enforces the hard entry cap and writes the cache, logging any eviction.
 func (g *Gatherer) persist() {
 	if dropped := g.cache.enforceCap(g.opts.MaxEntries); dropped > 0 {
@@ -229,7 +227,11 @@ func (g *Gatherer) persist() {
 	}
 }
 
-func (g *Gatherer) runPass(ctx context.Context) {
+// RunPass walks each due root once, bottom-up, refreshing due directories and
+// reusing cached totals for not-due subtrees, then persists the cache once. Start's
+// loop calls it on the cadence; it is exported so a consumer can drive exactly one
+// synchronous pass (a wiring test, a benchmark) without timing or polling.
+func (g *Gatherer) RunPass(ctx context.Context) {
 	now := time.Now()
 	var dirty bool
 
@@ -410,7 +412,7 @@ func (g *Gatherer) walk(ctx context.Context, dir string, depth int) (int64, int6
 		// routine and its contribution really is zero. Any other failure (permissions, a
 		// dead mount) means real content went uncounted, so the zero is a lower bound.
 		unreadable := !errors.Is(err, os.ErrNotExist)
-		g.cache.put(dir, Entry{ComputedAtS: now.Unix(), LastWalkMS: time.Since(t0).Milliseconds(), Incomplete: unreadable})
+		g.cache.Put(dir, Entry{ComputedAtS: now.Unix(), LastWalkMS: time.Since(t0).Milliseconds(), Incomplete: unreadable})
 		return 0, 0, unreadable, nil
 	}
 	entries, readErr := f.ReadDir(-1)
@@ -494,7 +496,7 @@ func (g *Gatherer) walk(ctx context.Context, dir string, depth int) (int64, int6
 	// Correctness of every reported size is therefore independent of this filter —
 	// it trades a cheap recomputation for a cache slot, nothing more.
 	if g.worthCaching(depth, entry) {
-		g.cache.put(dir, entry)
+		g.cache.Put(dir, entry)
 	} else {
 		g.cache.drop(dir)
 	}

@@ -128,7 +128,7 @@ func TestUnworthyEntryIsDroppedNotJustSkipped(t *testing.T) {
 
 	cache := newTestCache(t.TempDir())
 	// Pre-seed it the way an old cache file would.
-	cache.put(deep, Entry{Bytes: 999, FileCount: 1, ComputedAtS: 1})
+	cache.Put(deep, Entry{Bytes: 999, FileCount: 1, ComputedAtS: 1})
 	if _, ok := cache.Get(deep); !ok {
 		t.Fatal("precondition: entry should be seeded")
 	}
@@ -149,7 +149,7 @@ func TestUnworthyEntryIsDroppedNotJustSkipped(t *testing.T) {
 func TestEnforceCapKeepsTheLargestSubtrees(t *testing.T) {
 	c := newTestCache(t.TempDir())
 	for i := 0; i < 100; i++ {
-		c.put(filepath.Join("/d", string(rune('a'+i%26)), string(rune('0'+i/26))),
+		c.Put(filepath.Join("/d", string(rune('a'+i%26)), string(rune('0'+i/26))),
 			Entry{FileCount: int64(i)})
 	}
 	before := c.len()
@@ -172,7 +172,7 @@ func TestEnforceCapKeepsTheLargestSubtrees(t *testing.T) {
 
 func TestEnforceCapIsANoOpUnderTheCap(t *testing.T) {
 	c := newTestCache(t.TempDir())
-	c.put("/a", Entry{FileCount: 1})
+	c.Put("/a", Entry{FileCount: 1})
 	if dropped := c.enforceCap(10); dropped != 0 {
 		t.Errorf("dropped %d under the cap", dropped)
 	}
@@ -200,7 +200,7 @@ func TestStreamingSaveRoundTripsThroughLoad(t *testing.T) {
 		"/",
 	}
 	for i, p := range paths {
-		c.put(p, Entry{Bytes: int64(i * 1000), FileCount: int64(i), ComputedAtS: int64(1700000000 + i), LastWalkMS: int64(i)})
+		c.Put(p, Entry{Bytes: int64(i * 1000), FileCount: int64(i), ComputedAtS: int64(1700000000 + i), LastWalkMS: int64(i)})
 	}
 	if err := c.save(); err != nil {
 		t.Fatalf("save: %v", err)

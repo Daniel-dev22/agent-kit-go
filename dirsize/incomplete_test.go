@@ -146,7 +146,7 @@ func TestIncompleteSurvivesTheCachedReuseBranch(t *testing.T) {
 	cache := newTestCache(dir)
 	// A fresh (not-due) incomplete child: the parent must fold in its total AND its flag
 	// without descending, or an incomplete subtree silently becomes a confident one.
-	cache.put(child, Entry{Bytes: 500, FileCount: 7, ComputedAtS: time.Now().Unix(), Incomplete: true})
+	cache.Put(child, Entry{Bytes: 500, FileCount: 7, ComputedAtS: time.Now().Unix(), Incomplete: true})
 	g := NewGatherer(baselineConfig(dir), cache)
 	b, c, inc, err := g.walk(context.Background(), root, 0)
 	if err != nil {

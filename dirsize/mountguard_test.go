@@ -318,7 +318,7 @@ func TestSignatureChangesWhenAMountIsLeaked(t *testing.T) {
 }
 
 func TestNilGuardIsSafe(t *testing.T) {
-	// runPass leaves guard nil when mountinfo is unreadable; the walk must degrade to
+	// RunPass leaves guard nil when mountinfo is unreadable; the walk must degrade to
 	// "skip nothing" rather than panic.
 	var g *MountGuard
 	if _, skipped := g.SkipReason("/anything"); skipped {

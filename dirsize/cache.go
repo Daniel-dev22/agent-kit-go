@@ -91,7 +91,9 @@ func (c *Cache) Get(path string) (Entry, bool) {
 	return e, ok
 }
 
-func (c *Cache) put(path string, e Entry) {
+// Put stores an entry. The gatherer fills the cache itself; Put exists so a consumer
+// test can seed one without running a walk.
+func (c *Cache) Put(path string, e Entry) {
 	c.mu.Lock()
 	c.m[path] = e
 	c.mu.Unlock()
