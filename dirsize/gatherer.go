@@ -220,7 +220,7 @@ func (g *Gatherer) persist() {
 	if dropped := g.cache.enforceCap(g.opts.MaxEntries); dropped > 0 {
 		// Never silent: state what was discarded and what remains.
 		slog.Warn("dir size cache hit its entry cap, evicted smallest subtrees",
-			"dropped", dropped, "kept", g.cache.len(), "cap", g.opts.MaxEntries)
+			"dropped", dropped, "kept", g.cache.Len(), "cap", g.opts.MaxEntries)
 	}
 	if err := g.cache.save(); err != nil {
 		slog.Warn("dir size cache save failed", "error", err)

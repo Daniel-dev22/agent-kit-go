@@ -109,10 +109,22 @@ func (c *Cache) drop(path string) {
 	c.mu.Unlock()
 }
 
-func (c *Cache) len() int {
+// Len reports the number of cached directories.
+func (c *Cache) Len() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.m)
+}
+
+// Range calls fn for every cached entry under a read lock, so fn must not call back
+// into the cache. Iteration order is unspecified. It exists for consumer wiring tests
+// and diagnostics; the push path reads Size.
+func (c *Cache) Range(fn func(path string, e Entry)) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for p, e := range c.m {
+		fn(p, e)
+	}
 }
 
 // enforceCap is the hard backstop required by the bounded-growth rule: the

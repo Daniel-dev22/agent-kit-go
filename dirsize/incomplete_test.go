@@ -69,8 +69,8 @@ func TestOrdinaryTreeIsComplete(t *testing.T) {
 		t.Fatalf("walk = (%d, %d, incomplete=%v), want (30, 2, false): an exclude, a symlink and a clean tree are deliberate, not unread", b, c, inc)
 	}
 	for _, r := range cacheRows(t, cache, root) {
-		if e, _ := cache.Get(filepath.Join(root, r.rel)); e.Incomplete {
-			t.Errorf("%q flagged incomplete in a fully readable tree", r.rel)
+		if e, _ := cache.Get(filepath.Join(root, r.Rel)); e.Incomplete {
+			t.Errorf("%q flagged incomplete in a fully readable tree", r.Rel)
 		}
 	}
 }

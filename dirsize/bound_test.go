@@ -64,7 +64,7 @@ func TestWorthinessFilterDoesNotChangeAnyTotal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return b, c, cache.len()
+		return b, c, cache.Len()
 	}
 
 	// Unbounded: keep everything.
@@ -152,13 +152,13 @@ func TestEnforceCapKeepsTheLargestSubtrees(t *testing.T) {
 		c.Put(filepath.Join("/d", string(rune('a'+i%26)), string(rune('0'+i/26))),
 			Entry{FileCount: int64(i)})
 	}
-	before := c.len()
+	before := c.Len()
 	dropped := c.enforceCap(10)
 	if dropped != before-10 {
 		t.Fatalf("dropped %d, want %d", dropped, before-10)
 	}
-	if c.len() != 10 {
-		t.Fatalf("kept %d, want 10", c.len())
+	if c.Len() != 10 {
+		t.Fatalf("kept %d, want 10", c.Len())
 	}
 	// Everything kept must be at least as large as everything dropped.
 	c.mu.RLock()
@@ -221,8 +221,8 @@ func TestStreamingSaveRoundTripsThroughLoad(t *testing.T) {
 
 	c2 := newTestCache(dir)
 	c2.load()
-	if c2.len() != len(paths) {
-		t.Fatalf("loaded %d entries, want %d", c2.len(), len(paths))
+	if c2.Len() != len(paths) {
+		t.Fatalf("loaded %d entries, want %d", c2.Len(), len(paths))
 	}
 	for i, p := range paths {
 		got, ok := c2.Get(p)
@@ -288,8 +288,8 @@ func TestLegacyCacheIsNotReadAndIsReclaimed(t *testing.T) {
 	if got.Bytes != 777 || got.FileCount != 5 {
 		t.Errorf("v2 entry decoded wrong: %+v", got)
 	}
-	if c.len() != 1 {
-		t.Errorf("expected exactly the v2 entry, got %d", c.len())
+	if c.Len() != 1 {
+		t.Errorf("expected exactly the v2 entry, got %d", c.Len())
 	}
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
 		t.Error("legacy cache file was not reclaimed (295 MB on kd-nas01)")
