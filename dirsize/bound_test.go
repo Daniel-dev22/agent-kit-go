@@ -60,7 +60,7 @@ func TestWorthinessFilterDoesNotChangeAnyTotal(t *testing.T) {
 	run := func(cfg Options) (int64, int64, int) {
 		cache := newTestCache(t.TempDir())
 		g := &Gatherer{opts: cfg, cache: cache, lastAttempt: map[string]time.Time{}}
-		b, c, err := g.walk(context.Background(), root, 0)
+		b, c, _, err := g.walk(context.Background(), root, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -134,7 +134,7 @@ func TestUnworthyEntryIsDroppedNotJustSkipped(t *testing.T) {
 	}
 
 	g := &Gatherer{opts: boundCfg(2, 100, 0), cache: cache, lastAttempt: map[string]time.Time{}}
-	if _, _, err := g.walk(context.Background(), root, 0); err != nil {
+	if _, _, _, err := g.walk(context.Background(), root, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := cache.Get(deep); ok {
@@ -352,7 +352,7 @@ func TestAnchorResetsTheDisplayDepthBudget(t *testing.T) {
 		lastAttempt: map[string]time.Time{},
 		anchors:     map[string]struct{}{root: {}, repo: {}}, // as rebuildAnchors would
 	}
-	if _, _, err := g.walk(context.Background(), root, 0); err != nil {
+	if _, _, _, err := g.walk(context.Background(), root, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -386,7 +386,7 @@ func TestWithoutAnchorTheDeepRepoDirIsDropped(t *testing.T) {
 		lastAttempt: map[string]time.Time{},
 		anchors:     map[string]struct{}{root: {}}, // repo NOT an anchor
 	}
-	if _, _, err := g.walk(context.Background(), root, 0); err != nil {
+	if _, _, _, err := g.walk(context.Background(), root, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := cache.Get(inside); ok {

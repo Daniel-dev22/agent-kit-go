@@ -162,7 +162,7 @@ func TestDirSizeWalkMatchesIndependentOracle(t *testing.T) {
 
 	cache := newTestCache(dir)
 	g := NewGatherer(baselineConfig(dir), cache)
-	if _, _, err := g.walk(context.Background(), root, 0); err != nil {
+	if _, _, _, err := g.walk(context.Background(), root, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -228,7 +228,7 @@ func BenchmarkDirSizeWalk(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		cache := newTestCache(cfgDir)
 		g := NewGatherer(baselineConfig(cfgDir), cache)
-		if _, _, err := g.walk(context.Background(), benchRoot, 0); err != nil {
+		if _, _, _, err := g.walk(context.Background(), benchRoot, 0); err != nil {
 			b.Fatal(err)
 		}
 		dirs = cache.len()
@@ -237,7 +237,7 @@ func BenchmarkDirSizeWalk(b *testing.B) {
 	// Falsifiable control: a walk that visits less cannot report the oracle's digest.
 	cache := newTestCache(cfgDir)
 	g := NewGatherer(baselineConfig(cfgDir), cache)
-	if _, _, err := g.walk(context.Background(), benchRoot, 0); err != nil {
+	if _, _, _, err := g.walk(context.Background(), benchRoot, 0); err != nil {
 		b.Fatal(err)
 	}
 	if d := digestRows(cacheRows(b, cache, benchRoot)); d != benchWant {

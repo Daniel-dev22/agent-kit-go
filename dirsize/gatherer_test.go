@@ -71,7 +71,7 @@ func TestDirSizeWalkAccumulates(t *testing.T) {
 	cache := newTestCache(dir)
 	g := NewGatherer(testSizeConfig(dir), cache)
 
-	gotB, gotC, err := g.walk(context.Background(), root, 0)
+	gotB, gotC, _, err := g.walk(context.Background(), root, 0)
 	if err != nil {
 		t.Fatalf("walk: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestDirSizeWalkReusesNotDue(t *testing.T) {
 	// within the small cadence window, the parent walk must reuse it verbatim.
 	cache.put(sub, Entry{Bytes: 999, FileCount: 7, ComputedAtS: time.Now().Unix()})
 
-	gotB, gotC, err := g.walk(context.Background(), root, 0)
+	gotB, gotC, _, err := g.walk(context.Background(), root, 0)
 	if err != nil {
 		t.Fatalf("walk: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestSizeGathererExcludePaths(t *testing.T) {
 	}
 
 	// Walking the parent must skip the excluded subtree (size + count).
-	b, c, err := g.walk(context.Background(), dir, 0)
+	b, c, _, err := g.walk(context.Background(), dir, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

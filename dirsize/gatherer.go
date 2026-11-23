@@ -267,7 +267,7 @@ func (g *Gatherer) runPass(ctx context.Context) {
 		}
 		walked++
 		wctx, cancel := context.WithTimeout(ctx, g.opts.WalkTimeout)
-		_, _, err := g.walk(wctx, root, 0)
+		_, _, _, err := g.walk(wctx, root, 0)
 		cancel()
 		g.lastAttempt[root] = time.Now()
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
@@ -366,7 +366,7 @@ func (g *Gatherer) worthCaching(depth int, e Entry) bool {
 	return time.Duration(e.LastWalkMS)*time.Millisecond > g.opts.SlowWalk
 }
 
-// walk returns the recursive (bytes, fileCount) for dir, refreshing the cache
+// walk returns the recursive (bytes, fileCount, incomplete) for dir, refreshing the cache
 // for every directory it recomputes. A not-due cached directory is reused
 // without descending. ctx cancellation/timeout propagates up so in-progress
 // parents are NOT cached partial — already-cached children remain valid and the
@@ -374,9 +374,9 @@ func (g *Gatherer) worthCaching(depth int, e Entry) bool {
 //
 // depth is measured from the walk root, so the "shallow enough to be displayed"
 // test matches what the tree push can actually reach.
-func (g *Gatherer) walk(ctx context.Context, dir string, depth int) (int64, int64, error) {
+func (g *Gatherer) walk(ctx context.Context, dir string, depth int) (int64, int64, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	// Entering a path a tree can be rooted at restarts the display-depth budget, so
 	// every node the picker can show from that root stays cached.
@@ -385,7 +385,7 @@ func (g *Gatherer) walk(ctx context.Context, dir string, depth int) (int64, int6
 	}
 	now := time.Now()
 	if e, ok := g.cache.Get(dir); ok && now.Sub(e.computedAt()) < g.cadence(e) {
-		return e.Bytes, e.FileCount, nil // reuse, no descent
+		return e.Bytes, e.FileCount, e.Incomplete, nil // reuse, no descent
 	}
 
 	t0 := time.Now()
@@ -405,13 +405,19 @@ func (g *Gatherer) walk(ctx context.Context, dir string, depth int) (int64, int6
 		// Always cached regardless of worthiness: this entry exists to make the
 		// scheduler back off to cadence instead of retrying an unreadable
 		// directory every minute, which is a job no recomputation can do.
-		g.cache.put(dir, Entry{ComputedAtS: now.Unix(), LastWalkMS: time.Since(t0).Milliseconds()})
-		return 0, 0, nil
+		//
+		// A directory that VANISHED (ENOENT) between the parent listing and this open is
+		// routine and its contribution really is zero. Any other failure (permissions, a
+		// dead mount) means real content went uncounted, so the zero is a lower bound.
+		unreadable := !errors.Is(err, os.ErrNotExist)
+		g.cache.put(dir, Entry{ComputedAtS: now.Unix(), LastWalkMS: time.Since(t0).Milliseconds(), Incomplete: unreadable})
+		return 0, 0, unreadable, nil
 	}
 	entries, readErr := f.ReadDir(-1)
 	fd := int(f.Fd())
 
 	var bytes, count int64
+	var incomplete bool
 	for _, e := range entries {
 		name := e.Name()
 		if _, skip := g.opts.ExcludeBasenames[name]; skip {
@@ -431,16 +437,19 @@ func (g *Gatherer) walk(ctx context.Context, dir string, depth int) (int64, int6
 				slog.Debug("dir size: skipping mount", "dir", child, "reason", reason)
 				continue
 			}
-			cb, cc, cerr := g.walk(ctx, child, depth+1)
+			cb, cc, cinc, cerr := g.walk(ctx, child, depth+1)
 			if cerr != nil {
 				f.Close()
-				return 0, 0, cerr // ctx cancelled — don't cache this parent
+				return 0, 0, false, cerr // ctx cancelled — don't cache this parent
 			}
 			bytes += cb
 			count += cc
-		} else if sz, ok := sizeOfRegularFile(fd, name); ok {
+			incomplete = incomplete || cinc
+		} else if sz, ok, unreadable := sizeOfRegularFile(fd, name); ok {
 			bytes += sz
 			count++
+		} else if unreadable {
+			incomplete = true
 		}
 	}
 	f.Close()
@@ -450,7 +459,7 @@ func (g *Gatherer) walk(ctx context.Context, dir string, depth int) (int64, int6
 	// The ctx check stays unconditional so cancellation is still honoured promptly
 	// on the directories that do not sleep.
 	if err := ctx.Err(); err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	if g.opts.StepSleep > 0 {
 		g.stepN++
@@ -462,7 +471,7 @@ func (g *Gatherer) walk(ctx context.Context, dir string, depth int) (int64, int6
 			g.stepN = 0
 			select {
 			case <-ctx.Done():
-				return 0, 0, ctx.Err()
+				return 0, 0, false, ctx.Err()
 			case <-time.After(g.opts.StepSleep):
 			}
 		}
@@ -472,12 +481,14 @@ func (g *Gatherer) walk(ctx context.Context, dir string, depth int) (int64, int6
 		// Partial listing — cache what we summed but don't treat as authoritative
 		// for long; small cadence will recompute. Still record to enable backoff.
 		slog.Debug("dir size: partial readdir", "dir", dir, "error", readErr)
+		incomplete = true
 	}
 	entry := Entry{
 		Bytes:       bytes,
 		FileCount:   count,
 		ComputedAtS: now.Unix(),
 		LastWalkMS:  time.Since(t0).Milliseconds(),
+		Incomplete:  incomplete,
 	}
 	// The total is returned to the parent either way; only STORAGE is conditional.
 	// Correctness of every reported size is therefore independent of this filter —
@@ -487,20 +498,23 @@ func (g *Gatherer) walk(ctx context.Context, dir string, depth int) (int64, int6
 	} else {
 		g.cache.drop(dir)
 	}
-	return bytes, count, nil
+	return bytes, count, incomplete, nil
 }
 
 // sizeOfRegularFile stats a directory entry relative to its parent fd without
 // allocating a fileInfo or materialising the file's path. Returns the apparent
 // size and whether the entry is a regular file (symlinks/devices/etc. → false).
+// unreadable is true when the stat itself failed for a reason other than the entry
+// having vanished (ENOENT is routine); a dead-mount EIO there means a real file
+// went uncounted, which marks the directory total as a lower bound.
 // unix.Fstatat with AT_SYMLINK_NOFOLLOW stats the entry itself, never a target.
-func sizeOfRegularFile(dirFd int, name string) (int64, bool) {
+func sizeOfRegularFile(dirFd int, name string) (size int64, regular, unreadable bool) {
 	var st unix.Stat_t
 	if err := unix.Fstatat(dirFd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return 0, false
+		return 0, false, !errors.Is(err, unix.ENOENT)
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return 0, false
+		return 0, false, false
 	}
-	return st.Size, true
+	return st.Size, true, false
 }
