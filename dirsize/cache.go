@@ -92,7 +92,8 @@ func (c *Cache) Get(path string) (Entry, bool) {
 }
 
 // Put stores an entry. The gatherer fills the cache itself; Put exists so a consumer
-// test can seed one without running a walk.
+// test can seed one without running a walk. Gatherer.Start replaces the whole map
+// when it loads the persisted file, so seed AFTER Start (or drive RunPass alone).
 func (c *Cache) Put(path string, e Entry) {
 	c.mu.Lock()
 	c.m[path] = e
@@ -214,6 +215,12 @@ func (c *Cache) load() {
 	var m map[string]Entry
 	if err := json.Unmarshal(data, &m); err != nil {
 		slog.Warn("dir size cache corrupt, starting cold", "error", err, "path", c.path)
+		return
+	}
+	// A file holding the JSON literal `null` unmarshals to a nil map; adopting it would
+	// make the first Put panic on every boot until the file is deleted.
+	if m == nil {
+		slog.Warn("dir size cache holds null, starting cold", "path", c.path)
 		return
 	}
 	c.mu.Lock()

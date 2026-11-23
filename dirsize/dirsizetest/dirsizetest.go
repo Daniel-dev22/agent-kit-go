@@ -17,7 +17,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 )
 
@@ -164,27 +163,23 @@ func BenchShape() Shape {
 	}
 }
 
-var (
-	benchOnce sync.Once
-	benchRoot string
-	benchWant string
-)
-
-// EnsureBenchTree builds the benchmark tree once per process (under BASELINE_TREE_DIR
-// when set, so the tree can be reused across runs on a Pi) and returns its root with
-// the oracle digest every walker must reproduce.
+// EnsureBenchTree returns the benchmark tree's root with the oracle digest every walker
+// must reproduce. It builds under BASELINE_TREE_DIR when set (so a Pi run can reuse a
+// tree across runs), otherwise under b.TempDir().
+//
+// It deliberately keeps NO process-wide state: the testing package runs a benchmark
+// function several times (N=1, then the timed N, then once per -count) and removes
+// b.TempDir() after each, so a cached path would point at a deleted tree on the second
+// call and the timed loop would measure a no-op. Call it before b.ResetTimer.
 func EnsureBenchTree(b *testing.B, excludeBasenames map[string]struct{}) (root, wantDigest string) {
 	b.Helper()
-	benchOnce.Do(func() {
-		base := os.Getenv("BASELINE_TREE_DIR")
-		if base == "" {
-			base = b.TempDir()
-		}
-		benchRoot = filepath.Join(base, "tree")
-		if _, err := os.Stat(benchRoot); err != nil {
-			BuildTree(b, benchRoot, BenchShape())
-		}
-		benchWant = DigestRows(RowsFromOracle(OracleTally(b, benchRoot, excludeBasenames)))
-	})
-	return benchRoot, benchWant
+	base := os.Getenv("BASELINE_TREE_DIR")
+	if base == "" {
+		base = b.TempDir()
+	}
+	root = filepath.Join(base, "tree")
+	if _, err := os.Stat(root); err != nil {
+		BuildTree(b, root, BenchShape())
+	}
+	return root, DigestRows(RowsFromOracle(OracleTally(b, root, excludeBasenames)))
 }

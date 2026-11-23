@@ -8,9 +8,9 @@ package dirsize
 //     perpetual walker. Each cycle it walks the due backup roots, sleeps until
 //     the next root is due, and repeats. If a pass finishes in 20 min and the
 //     cadence is 6h, it idles ~5h40m before the next pass.
-//   - The tree push only ever READS this cache (trees.go annotateSizes): it
-//     attaches a `size` to directory nodes that already have a value and omits
-//     it otherwise. The push never computes, enqueues, or blocks on the gatherer.
+//   - A consumer's tree push only ever READS this cache (Cache.Size): it attaches a
+//     size to directory nodes that already have a value and omits it otherwise. The
+//     push never computes, enqueues, or blocks on the gatherer.
 //
 // Cadence (the "4×/day, large 1×/day" rule):
 //   - A directory refreshes every SmallRefresh (~6h → 4×/day).
@@ -27,8 +27,9 @@ package dirsize
 //     stack Stat_t; file paths are never materialised, only directory paths
 //     (the cache keys). See sizeOfRegularFile.
 //
-// Persistence: the cache is written atomically to CONFIG_DIR/dir_sizes.json so
-// a restart resumes the cadence instead of re-walking every root from scratch.
+// Persistence: the cache is written atomically to the path the consumer passes to
+// NewCache (the kit owns no file names) so a restart resumes the cadence instead of
+// re-walking every root from scratch.
 // First run: an empty cache means the push simply reports no sizes until the
 // gatherer fills them — never a synchronous walk storm at startup.
 
@@ -38,6 +39,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -57,6 +59,11 @@ type Gatherer struct {
 	// restart we simply re-attempt, which is correct.
 	lastAttempt map[string]time.Time
 	firstPass   bool
+
+	// passMu makes RunPass single-flight: Start's loop and a consumer's own call
+	// (a wiring test, an on-demand refresh) serialise instead of racing on the
+	// per-pass state below (lastAttempt, guard, anchors, stepN).
+	passMu sync.Mutex
 
 	// guard classifies foreign mounts (pseudo filesystems, mounted disk images,
 	// orphaned dm targets) so the walk never descends into one. Rebuilt at the
@@ -231,7 +238,12 @@ func (g *Gatherer) persist() {
 // reusing cached totals for not-due subtrees, then persists the cache once. Start's
 // loop calls it on the cadence; it is exported so a consumer can drive exactly one
 // synchronous pass (a wiring test, a benchmark) without timing or polling.
+//
+// RunPass alone never loads the persisted file or prunes now-excluded keys: that
+// boot work belongs to Start. Concurrent calls are serialised.
 func (g *Gatherer) RunPass(ctx context.Context) {
+	g.passMu.Lock()
+	defer g.passMu.Unlock()
 	now := time.Now()
 	var dirty bool
 
