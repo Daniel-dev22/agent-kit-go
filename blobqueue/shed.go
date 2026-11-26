@@ -159,7 +159,11 @@ func (q *Queue) flushLoss(ctx context.Context, tx *sql.Tx, loss *lossAcc) (tally
 	}
 	var seq, oldSize int64
 	var body []byte
-	err := tx.QueryRowContext(ctx, `SELECT seq,body,size FROM blobq_items WHERE protected=1 AND seq>? ORDER BY seq DESC LIMIT 1`, int64(q.inflightMax)).Scan(&seq, &body, &oldSize)
+	// Only a marker never handed to the Sender is updated in place. Once a batch holding it has been
+	// sent (even if the send failed, e.g. a timeout AFTER the receiver stored it) its (epoch, seq) may
+	// be known to the receiver, which would discard a changed body as a duplicate; later loss goes in
+	// a NEW marker row carrying only the delta, and the receiver sums markers.
+	err := tx.QueryRowContext(ctx, `SELECT seq,body,size FROM blobq_items WHERE protected=1 AND sent=0 ORDER BY seq DESC LIMIT 1`).Scan(&seq, &body, &oldSize)
 	merged := LossMarker{}
 	switch {
 	case err == nil:
@@ -219,6 +223,7 @@ func (q *Queue) ensureFloor(ctx context.Context, size int64) error {
 			// Unmeasurable: accept (the alternative is refusing all traffic on a transient statfs error)
 			// and surface it in Stats.
 			q.lastErr.Store("statfs: " + err.Error())
+			q.statfsErrs.Add(1)
 			return nil
 		}
 		need := q.floorBytes(total) + uint64(size)

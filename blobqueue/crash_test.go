@@ -61,7 +61,7 @@ func TestCrashChild(t *testing.T) {
 				fmt.Fprintf(f, "%d\n", it.Seq) // the "receiver" records it before the ack returns
 			}
 			time.Sleep(2 * time.Millisecond) // widen the window between receipt and delete
-			return Ack{Accepted: len(items)}, nil
+			return NewAck(len(items), 0), nil
 		}
 		_ = q.Run(context.Background(), send)
 	}

@@ -12,7 +12,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-TESTS = r"Cap|Age|Floor|Marker|Inflight|Ack|Statfs"
+TESTS = r"Cap|Age|Floor|Marker|Inflight|Ack|Statfs|Vacuum|Sticky"
 
 # (file, original, mutant, what it breaks)
 MUTANTS = [
@@ -28,6 +28,12 @@ MUTANTS = [
     ("shed.go", "WHERE protected=0 AND seq>? AND seq<?", "WHERE protected=0 AND seq>=? AND seq<?", "in-flight high-water mark off by one"),
     ("shed.go", "return sb < deficit+(1<<20)", "return sb > deficit+(1<<20)", "floor shed target flipped"),
     ("queue.go", "if q.pendRefused > 0 {", "if q.pendRefused < 0 {", "refusals never folded into the marker"),
+    ("shed.go", "WHERE protected=1 AND sent=0 ORDER BY seq DESC LIMIT 1", "WHERE protected=1 ORDER BY seq DESC LIMIT 1", "a marker already sent is rewritten in place"),
+    ("shed.go", "PRAGMA incremental_vacuum", "PRAGMA user_version", "incremental_vacuum removed (file never shrinks)"),
+    ("queue.go", "PRAGMA auto_vacuum=INCREMENTAL", "PRAGMA user_version=0", "auto_vacuum never enabled"),
+    ("drain.go", "if a.Accepted == nil || a.Duplicate == nil {", "if a.Accepted == nil && a.Duplicate == nil {", "partial ack accepted"),
+    ("drain.go", "+len(a.Rejected) != len(rows) {", "+len(a.Rejected) == len(rows) {", "ack count check inverted"),
+    ("shed.go", "q.statfsErrs.Add(1)", "q.statfsErrs.Add(0)", "statfs failures not counted"),
 ]
 
 

@@ -89,7 +89,7 @@ func (r *recorder) send(_ context.Context, frame []byte) (Ack, error) {
 		return a, nil
 	}
 	r.got = append(r.got, cp...)
-	return Ack{Accepted: len(items)}, nil
+	return NewAck(len(items), 0), nil
 }
 
 func TestEnqueueDrainRoundTripBinary(t *testing.T) {
@@ -341,6 +341,11 @@ func TestFloorShedsOldestAndReclaimsFile(t *testing.T) {
 	var q *Queue
 	q, path = newQ(t, Config{Statfs: st, FloorBytes: 1 << 20, FloorPercent: -1, MaxRows: -1, MaxBytes: -1})
 	enq(t, q, 60, 20_000) // ~100 KB bodies, ~6 MB
+	// Fold the WAL into the main file so `before` is the main file alone: a WAL truncation by itself
+	// must not be able to pass this test, only a real incremental_vacuum shrinks the MAIN file.
+	if _, err := q.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
 	before := fileSize(t, path)
 	limit.Store(before + 1<<20 + 50) // 50 B above the floor: the next ~100 KB row needs a deficit
 	if _, err := q.Enqueue(context.Background(), Item{Signal: "logs", Body: gz(20_000, 9)}); err != nil {
@@ -350,8 +355,12 @@ func TestFloorShedsOldestAndReclaimsFile(t *testing.T) {
 	if st2.ShedFloor == 0 {
 		t.Fatalf("nothing shed at the floor: %+v", st2)
 	}
-	if after := fileSize(t, path); after >= before {
-		t.Fatalf("db file did not shrink: before %d after %d (shed rows freed nothing)", before, after)
+	if fi, err := os.Stat(path); err != nil || fi.Size() >= before {
+		t.Fatalf("main db file did not shrink: before %d after %v (%v): shed rows freed nothing", before, fi, err)
+	}
+	var free int
+	if err := q.db.QueryRow(`PRAGMA freelist_count`).Scan(&free); err != nil || free != 0 {
+		t.Fatalf("freelist_count = %d (%v): freed pages were never returned to the filesystem", free, err)
 	}
 	m, _ := marker(t, q)
 	if m.Floor != st2.ShedFloor || m.FirstSeq != 1 {
@@ -413,7 +422,7 @@ func TestAckClassification(t *testing.T) {
 	var dead []DeadLetter
 	q.cfg.OnDead = func(d DeadLetter) { dead = append(dead, d) }
 	rec := &recorder{ack: func([]Item) (Ack, error) {
-		return Ack{Accepted: 1, Duplicate: 1, Rejected: []Rejection{{Seq: 2, Code: "bad", Retryable: false}, {Seq: 4, Code: "busy", Retryable: true}}}, nil
+		return NewAck(1, 1, Rejection{Seq: 2, Code: "bad", Retryable: false}, Rejection{Seq: 4, Code: "busy", Retryable: true}), nil
 	}}
 	n, err := q.drainOnce(context.Background(), rec.send)
 	if err == nil || n != 3 {
@@ -548,7 +557,7 @@ func TestRunBacksOffAndRecovers(t *testing.T) {
 			return Ack{}, errors.New("down")
 		}
 		_, items, _ := DecodeFrame(frame, Limits{})
-		return Ack{Accepted: len(items)}, nil
+		return NewAck(len(items), 0), nil
 	}
 	go func() {
 		for q.Stats(context.Background()).Rows != 0 {

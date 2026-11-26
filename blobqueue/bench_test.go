@@ -235,7 +235,7 @@ func BenchmarkBlobDrain(b *testing.B) {
 			bodies := benchBodies(size)
 			ack := func(_ context.Context, frame []byte) (Ack, error) {
 				_, items, err := DecodeFrame(frame, Limits{})
-				return Ack{Accepted: len(items)}, err
+				return NewAck(len(items), 0), err
 			}
 			var m meter
 			b.ResetTimer()

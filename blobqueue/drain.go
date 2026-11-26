@@ -16,12 +16,42 @@ type Rejection struct {
 	Retryable bool   `json:"retryable"`
 }
 
-// Ack is the receiver's answer to one frame. Every item NOT listed in Rejected is treated as
-// delivered (accepted, or a duplicate the receiver already had under the same (epoch, seq)).
+// Ack is the receiver's answer to one frame. Accepted and Duplicate are pointers so a 2xx whose body
+// lacks them (wrong route, empty reply) is DETECTED, not read as zero: the queue holds the batch
+// unless accepted + duplicate + len(rejected) == the number of items sent. Every item NOT listed in
+// Rejected is then treated as delivered. Unmarshal the reply body straight into an Ack, or use NewAck.
 type Ack struct {
-	Accepted  int         `json:"accepted"`
-	Duplicate int         `json:"duplicate"`
+	Accepted  *int        `json:"accepted"`
+	Duplicate *int        `json:"duplicate"`
 	Rejected  []Rejection `json:"rejected"`
+}
+
+// NewAck builds a well-formed Ack.
+func NewAck(accepted, duplicate int, rejected ...Rejection) Ack {
+	return Ack{Accepted: &accepted, Duplicate: &duplicate, Rejected: rejected}
+}
+
+// validate mirrors eventoutbox.BatchOutbox's ack check: the counts must be present, non-negative and
+// account for every item, and each rejection must name a distinct item of this batch.
+func (a Ack) validate(rows []qrow) error {
+	if a.Accepted == nil || a.Duplicate == nil {
+		return errors.New("blobqueue: 2xx without an accepted/duplicate ack")
+	}
+	if *a.Accepted < 0 || *a.Duplicate < 0 || *a.Accepted+*a.Duplicate+len(a.Rejected) != len(rows) {
+		return fmt.Errorf("blobqueue: ack shortfall: accepted=%d duplicate=%d rejected=%d batch=%d", *a.Accepted, *a.Duplicate, len(a.Rejected), len(rows))
+	}
+	in := make(map[uint64]bool, len(rows))
+	for _, r := range rows {
+		in[r.Seq] = true
+	}
+	seen := make(map[uint64]bool, len(a.Rejected))
+	for _, rj := range a.Rejected {
+		if !in[rj.Seq] || seen[rj.Seq] {
+			return fmt.Errorf("blobqueue: ack rejects seq %d not in batch or twice", rj.Seq)
+		}
+		seen[rj.Seq] = true
+	}
+	return nil
 }
 
 // Sender delivers one encoded frame. A non-nil error means nothing was acknowledged (transport
@@ -31,7 +61,8 @@ type Sender func(ctx context.Context, frame []byte) (Ack, error)
 
 type qrow struct {
 	Item
-	size int64
+	size      int64
+	protected bool
 }
 
 // Run drains the queue oldest-first until ctx ends: it sends a batch, deletes what the receiver
@@ -128,6 +159,9 @@ func (q *Queue) drainOnce(ctx context.Context, send Sender) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	if err := ack.validate(rows); err != nil {
+		return 0, err // hold the whole batch: an unparseable 2xx proves nothing was stored
+	}
 	keep := map[uint64]struct{}{}
 	for _, rj := range ack.Rejected {
 		if rj.Retryable {
@@ -172,17 +206,18 @@ func (q *Queue) drainOnce(ctx context.Context, send Sender) (int, error) {
 func (q *Queue) loadBatch(ctx context.Context) ([]qrow, error) {
 	q.wmu.Lock()
 	defer q.wmu.Unlock()
-	rs, err := q.db.QueryContext(ctx, `SELECT seq,signal,ctype,cenc,body,size FROM blobq_items ORDER BY seq LIMIT ?`, q.cfg.MaxBatchItems)
+	rs, err := q.db.QueryContext(ctx, `SELECT seq,signal,ctype,cenc,body,size,protected FROM blobq_items ORDER BY seq LIMIT ?`, q.cfg.MaxBatchItems)
 	if err != nil {
 		return nil, fmt.Errorf("blobqueue: load: %w", err)
 	}
-	defer rs.Close()
 	var out []qrow
+	var markers []any
 	total := 0
 	for rs.Next() {
 		var r qrow
-		var seq int64
-		if err := rs.Scan(&seq, &r.Signal, &r.ContentType, &r.ContentEncoding, &r.Body, &r.size); err != nil {
+		var seq, prot int64
+		if err := rs.Scan(&seq, &r.Signal, &r.ContentType, &r.ContentEncoding, &r.Body, &r.size, &prot); err != nil {
+			rs.Close()
 			return nil, err
 		}
 		r.Seq = uint64(seq)
@@ -190,10 +225,23 @@ func (q *Queue) loadBatch(ctx context.Context) ([]qrow, error) {
 			break
 		}
 		total += len(r.Body)
+		if prot == 1 {
+			r.protected = true
+			markers = append(markers, seq)
+		}
 		out = append(out, r)
 	}
-	if err := rs.Err(); err != nil {
+	err = rs.Err()
+	rs.Close()
+	if err != nil {
 		return nil, err
+	}
+	if len(markers) > 0 {
+		// A loss marker that goes out may already be stored by the receiver even if this send fails,
+		// so it must never be rewritten (see flushLoss); later loss gets a new marker row.
+		if _, err := q.db.ExecContext(ctx, `UPDATE blobq_items SET sent=1 WHERE protected=1 AND seq IN (?`+strings.Repeat(",?", len(markers)-1)+`)`, markers...); err != nil {
+			return nil, fmt.Errorf("blobqueue: mark marker sent: %w", err)
+		}
 	}
 	if len(out) > 0 {
 		q.inflightMax = out[len(out)-1].Seq
@@ -261,6 +309,7 @@ type Stats struct {
 	ShedFloor  int64
 	ShedByte   int64 // logical bytes shed, all reasons
 	Refused    int64 // Enqueue calls refused at the free-disk floor
+	StatfsErrs int64 // sticky count of failed free-space reads; while it grows the floor is silently OFF
 	Sent       int64
 	Dead       int64
 	LastError  string
@@ -275,7 +324,7 @@ func (q *Queue) Stats(ctx context.Context) Stats {
 		Epoch: q.epoch, Durability: q.durability, Rows: rows, Bytes: bytes,
 		ShedAge: q.shedAge.Load(), ShedRows: q.shedRows.Load(), ShedBytes: q.shedBytes.Load(),
 		ShedFloor: q.shedFloor.Load(), ShedByte: q.shedByteTotal.Load(),
-		Refused: q.refused.Load(), Sent: q.sent.Load(), Dead: q.dead.Load(),
+		Refused: q.refused.Load(), Sent: q.sent.Load(), Dead: q.dead.Load(), StatfsErrs: q.statfsErrs.Load(),
 	}
 	s.LastError, _ = q.lastErr.Load().(string)
 	var created int64

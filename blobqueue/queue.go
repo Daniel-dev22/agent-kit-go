@@ -90,6 +90,7 @@ type Queue struct {
 	shedAge, shedRows, shedBytes, shedFloor atomic.Int64 // rows shed, by reason
 	shedByteTotal                           atomic.Int64
 	refused, dead, sent                     atomic.Int64
+	statfsErrs                              atomic.Int64 // sticky: while it grows the floor is silently off
 	lastErr                                 atomic.Value // string
 }
 
@@ -127,17 +128,23 @@ func New(db *sql.DB, cfg Config) (*Queue, error) {
 		q.durability = "weak"
 	}
 
-	// auto_vacuum must be chosen before the tables exist; set it first so a fresh database gets it.
-	if _, err := db.ExecContext(ctx, `PRAGMA auto_vacuum=INCREMENTAL`); err != nil {
+	// auto_vacuum is chosen per connection and only takes effect when the tables are created (or on
+	// VACUUM), so the pragma, the schema and the VACUUM must share ONE pooled connection.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("blobqueue: conn: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA auto_vacuum=INCREMENTAL`); err != nil {
 		return nil, fmt.Errorf("blobqueue: auto_vacuum: %w", err)
 	}
-	if err := q.initSchema(ctx); err != nil {
+	if err := q.initSchema(ctx, conn); err != nil {
 		return nil, err
 	}
 	var av int
-	if err := db.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&av); err == nil && av != 2 {
+	if err := conn.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&av); err == nil && av != 2 {
 		// An existing database created without it: rebuild once so shedding can return space.
-		if _, err := db.ExecContext(ctx, `VACUUM`); err != nil {
+		if _, err := conn.ExecContext(ctx, `VACUUM`); err != nil {
 			log.Warn("blobqueue: could not enable incremental vacuum; shedding will not shrink the file", "err", err)
 		}
 	}
@@ -211,8 +218,8 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-func (q *Queue) initSchema(ctx context.Context) error {
-	tx, err := q.db.BeginTx(ctx, nil)
+func (q *Queue) initSchema(ctx context.Context, conn *sql.Conn) error {
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("blobqueue: begin: %w", err)
 	}
@@ -228,7 +235,8 @@ func (q *Queue) initSchema(ctx context.Context) error {
 			body       BLOB    NOT NULL,
 			size       INTEGER NOT NULL,
 			created_at INTEGER NOT NULL,
-			protected  INTEGER NOT NULL DEFAULT 0
+			protected  INTEGER NOT NULL DEFAULT 0,
+			sent       INTEGER NOT NULL DEFAULT 0  -- 1 once a batch holding this row was handed to the Sender
 		);
 		CREATE TABLE IF NOT EXISTS blobq_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 	`); err != nil {
