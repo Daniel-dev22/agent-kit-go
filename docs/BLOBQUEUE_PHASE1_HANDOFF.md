@@ -30,15 +30,26 @@ rejections are dead-lettered (`OnDead`); a retryable one holds that row. Errors:
   kill -9 survives WAL+NORMAL; power loss needs `synchronous=FULL` in the DSN (the caller owns the DB).
 
 ## Tests (targeted, `-race`)
-28 tests + 1 fuzz target + 4 benchmarks; all pass; statement coverage 86.8%. Crash tests re-exec the test binary and
+32 tests (ack validation is a 10-case table) + 1 fuzz target + 4 benchmarks; all pass; statement coverage 86.8%. Crash tests re-exec the test binary and
 SIGKILL it mid-enqueue (3 cycles, every acked seq present, integrity_check ok, seq monotonic) and mid-drain (nothing
 lost, redelivery confined to one in-flight batch). Fuzz `FuzzDecodeFrame`: 1,442,547 execs in 30 s, no failure; any
-frame that decodes re-encodes byte-identically. Mutation check `blobqueue/mutation_check.py`: 12/12 mutants killed
-(row/byte cap, age cutoff, floor comparison, stricter-floor-wins, refuse-when-empty, protected rows, in-flight mark,
-shed target, refusal fold-in). Concurrency: 8 producers + the drainer, every (epoch, seq) delivered exactly once.
+frame that decodes re-encodes byte-identically. Mutation check `blobqueue/mutation_check.py`: 18/18 mutants killed
+(caps, age cutoff, floor comparison, stricter-floor-wins, refuse-when-empty, protected rows, in-flight mark, shed
+target, refusal fold-in, sent-marker rewrite, removed incremental_vacuum, auto_vacuum off, partial/inverted ack check,
+uncounted statfs error). Concurrency: 8 producers + the drainer, every (epoch, seq) delivered exactly once.
+Advisor round fixes (each with a test that fails on the old behaviour): (1) a loss marker already handed to the
+Sender (`sent=1`) is never rewritten, because a deduping receiver would drop the update; later loss is a new marker
+and the receiver SUMS markers (test uses a deduping receiver that stores then errors); (2) `Ack.Accepted/Duplicate`
+are pointers and the batch is held unless the counts account for every item (an empty 2xx deletes nothing);
+(3) the floor test now asserts the MAIN file shrinks and `freelist_count`==0 (a WAL truncation alone cannot pass),
+and `auto_vacuum`==2 is asserted on a fresh and on a pre-existing file (pinned `sql.Conn`); (4) `Stats.StatfsErrs`
+is a sticky counter so a silently disabled floor stays visible.
+What resets on restart: the in-memory shed/refused/sent/dead counters and the pending refusal count. The durable
+record of loss is the marker row (totals are re-derived at `New`).
 
 ## Benchmarks, Pi class (measured)
-Pi: aarch64, 4 cores, MemAvailable 3.46 GiB at start, SD/disk `/var/tmp`, GOMAXPROCS=2, `systemd-run` unit
+Pi: aarch64, 4 cores, MemAvailable 3.46 GiB at start, `/var/tmp` on **a USB-attached SSD (sda, ROTA 0), NOT an SD
+card** (fsync here is ~4.5 ms; an SD card is likely slower and was NOT measured), GOMAXPROCS=2, `systemd-run` unit
 MemoryMax=1G CPUQuota=200% AllowedCPUs=2-3 RuntimeMaxSec capped, 300 bodies x count 5 (drain: 1000 rows x 3), medians.
 "Before" = `eventoutbox.BatchOutbox` carrying the same body base64-wrapped in a JSON object (the rejected option).
 Bodies are incompressible random bytes (like gzip).
@@ -55,7 +66,16 @@ Bodies are incompressible random bytes (like gzip).
 | 16 KiB | 731 / 437 | 1.0 / 1.3 | 5.2 / 8.9 | 1153 / 1477 |
 | 64 KiB | 351 / 132 | 1.5 / 2.8 | 58 / 167 | 2093 / 3427 |
 
-| drain (ack-all sender) | bodies/s | CPU ms/1k | RSS MiB |
+Re-run on the Pi AFTER the advisor fixes (FULL, count 5, medians; blobqueue / before): 16 KiB **170 / 169** bodies/s
+(parity; the baseline itself moved 142 -> 169 between runs), p99 28 / 33 ms, CPU 1773 / 1923 ms/1k; 64 KiB **142 / 117**
+bodies/s, p99 42 / 47 ms, disk 153614 / 189645 B, CPU 2567 / 3880 ms/1k. No regression from the hardening. Honest
+reading: FULL enqueue is fsync-bound, so throughput is parity at <=16 KiB; the real wins are bytes and CPU at 64 KiB.
+
+Drain: NOT like for like. The blobqueue row calls `drainOnce` in-process with an ack-all sender; the baseline goes
+through HTTP + JSON with a 1 ms sleep-poll. Do not quote the ratio as a headline; it only shows the binary path costs
+no more than the JSON one. Post-fix Pi drain, blobqueue / before: 1 KiB 8807 / 3774, 16 KiB 2592 / 442, 64 KiB 1126 / 148 bodies/s.
+
+| drain (ack-all sender, first Pi run) | bodies/s | CPU ms/1k | RSS MiB |
 |---|---|---|---|
 | 1 KiB  blobqueue / before | 5812 / 3271 | 93 / 269 | 20 / 46 |
 | 16 KiB | 2350 / 396 | 340 / 2301 | 28 / 46 |
@@ -65,10 +85,11 @@ Bodies are incompressible random bytes (like gzip).
   -c -e trace=fsync` on the Pi, 16 KiB FULL, 301 enqueues: **329 fsync calls** = ~1 per Enqueue plus schema/purge setup.
 - Write amplification at FULL: 1 KiB body writes ~16 KiB (4 pages: row, sqlite_sequence, WAL); large bodies ~2.4x (WAL
   + checkpoint copy). Equal to the baseline at 1 KiB, 19% less at 64 KiB (no base64).
-- The durable cost floor is one fsync (~4.5 ms) per body: 134-194 bodies/s per writer. Planned load is ~1 body/s per
-  Traefik (one OTLP batch per second), so **group commit was NOT built**: measured need absent (64 KiB FULL still
-  1.3x the 100/s ceiling). If a node ever exceeds it, `Enqueue` already blocks until commit, so concurrent callers can
-  share a transaction with no API change; re-benchmark before building.
+- The durable cost floor is one fsync (~4.5 ms on this USB SSD) per body: 134-194 bodies/s per writer, i.e. above the
+  brief's 10-100 bodies/s ceiling at every size here (64 KiB FULL: 1.4x). **Group commit was NOT built** on that
+  measurement. It is NOT proven for an SD-card node: before enabling FULL on one, re-run `BenchmarkBlobEnqueue/*/FULL`
+  there; build group commit (concurrent `Enqueue` callers share one transaction, no API change) only if the measured
+  ceiling is under 2x that node's real rate. Open for otel-orch: which Pi-class nodes keep the queue on mmcblk.
 - Variance caveat: Pi NORMAL runs spread up to 2.8x run to run (1 KiB NORMAL: 1018..2815 bodies/s), and a first run of
   a fresh process on the dev host measured 7.3 ms/enqueue vs 1.5 ms on rerun. The 1 KiB NORMAL "-15%" vs the baseline is
   inside that noise and is not claimed as a regression. No threshold was changed; no fix was needed from the numbers.

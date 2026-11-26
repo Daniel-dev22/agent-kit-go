@@ -33,12 +33,17 @@ one transaction (group commit) with no API change. Group commit is built ONLY if
 
 ## 3. Schema
 
-- `blobq_items(seq INTEGER PRIMARY KEY AUTOINCREMENT, signal, ctype, cenc, body BLOB, size, created_at, attempts, marker INTEGER)`.
+- `blobq_items(seq INTEGER PRIMARY KEY AUTOINCREMENT, signal, ctype, cenc, body BLOB, size, created_at, protected, sent)`.
   AUTOINCREMENT is mandatory: a bare INTEGER PRIMARY KEY restarts at 1 when the table drains empty and the
   receiver would dedupe the new rows as duplicates (silent loss). Test: drain to empty, enqueue, seq > previous max.
-- `blobq_meta(key,value)`: `epoch` (random, new if the DB is recreated), `rows`, `bytes` (transactional
-  running totals, never SUM() per enqueue), shed counters (rows, bytes, oldest/newest ts, seq range), refused count.
-- `PRAGMA auto_vacuum=INCREMENTAL` is set before the tables exist so shedding can return space to the FS.
+  `protected=1` marks the loss marker (never shed); `sent=1` is set when a batch holding that marker is loaded for
+  sending (see section 6).
+- `blobq_meta(key,value)`: only `epoch` (random, new if the DB is recreated). Running totals (rows, logical bytes) are
+  derived ONCE at `New` with a single SUM and then kept in memory under the write mutex, never SUM() per enqueue.
+  Shed/refused/sent/dead counters and the pending refusal count are in-memory and restart from zero; the loss
+  marker ROW is the durable record of what was shed, delivered to the receiver like any item.
+- `PRAGMA auto_vacuum=INCREMENTAL` is set on one pinned `sql.Conn` together with the schema transaction (and a
+  one-time `VACUUM` for an existing file created without it), because the pragma is per connection.
 
 ## 4. Wire frame (versioned, length-prefixed, no base64)
 
@@ -60,11 +65,20 @@ max age, max bytes (logical, running total), max rows, and a free-disk floor on 
 (percent AND absolute bytes; the stricter wins; `Bavail`; statfs injected for tests; path from config or
 `PRAGMA database_list`). On a floor breach: shed oldest in batches, then `incremental_vacuum` + WAL checkpoint
 so space really returns; STOP when the queue is empty (something else is filling the disk) and refuse new rows
-(`ErrDiskFloor`, counted as loss). Shed counters live in meta, updated in the same transaction as the delete.
+(`ErrDiskFloor`, counted as loss; the refusal count reaches the marker with the next written row). The marker is
+updated in the same transaction as the delete. An unmeasurable statfs fails OPEN (refusing all traffic on a transient
+error is worse) and is surfaced by the sticky `Stats.StatfsErrs` counter: while it grows the floor is silently off.
 
-Loss marker: one coalesced marker row, updated in place, with its own seq, protected from shedding, carrying
-{rows, bytes, oldest/newest ts, seq range shed, refused}. It is delivered like any item so a gap is visible
-downstream instead of reading as quiet.
+Loss marker: a coalesced marker row with its own seq, protected from shedding, carrying {rows, bytes, oldest/newest
+ts, seq range shed, refused, per-reason counts}. It is updated in place ONLY while `sent=0`. Once a batch holding it
+has been handed to the Sender (even if that send failed after the receiver stored it) the row is never rewritten:
+the receiver dedupes on (epoch, seq) and would discard changed counts. Later loss goes into a NEW marker carrying
+only the delta, so **the receiver must SUM markers**. Test: a deduping receiver that stores then errors; the summed
+marker rows must equal rows shed. `MaxRows` counts the marker row (transiently cap+1).
+
+Ack contract: `Ack.Accepted` and `Ack.Duplicate` are pointers; the queue holds the whole batch unless both are
+present, non-negative, accepted+duplicate+len(rejected) == items sent, and every rejection names a distinct item of
+the batch (mirrors `eventoutbox.BatchOutbox`'s ack check). An empty or wrong-route 2xx therefore deletes nothing.
 
 ## 7. Durability statement
 
