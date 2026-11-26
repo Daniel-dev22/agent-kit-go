@@ -53,7 +53,11 @@ refused loss marker's body is handed to `OnDead` (`DeadLetter.Body`); test asser
 mutants, coverage 87.4%, fuzz smoke 648k execs clean. DEFERRED with reason (design choices, LOW, need weeks of outage):
 loss markers have no own bound (cap = a policy choice between durability and size; stage 2 decides with the receiver);
 age shedding trusts the wall clock (a Pi clock step mis-sheds, counted as `age`, never silent; fixing needs a monotonic
-or boot-id stamp, a schema change). Hot paths (Enqueue/drain) were not touched, so the Pi numbers above stand.
+or boot-id stamp, a schema change). Per-item hot paths (the Enqueue transaction, row load/delete) were not touched; New,
+Run, drainOnce and reclaim changed but none runs per item, so the Pi numbers above stand. Round 2 (delta-only, frozen
+7cd1ad0): 0 HIGH, 0 MED, 2 LOW, review closed. Known gap: no test or mutant catches a revert of the drained
+`incremental_vacuum` read or the checkpoint `busy` branch (modernc's Exec already loops the rows, and busy needs a
+second writer); the code comments carry the reason.
 What resets on restart: the in-memory shed/refused/sent/dead counters and the pending refusal count. The durable
 record of loss is the marker row (totals are re-derived at `New`).
 
