@@ -48,8 +48,8 @@ What resets on restart: the in-memory shed/refused/sent/dead counters and the pe
 record of loss is the marker row (totals are re-derived at `New`).
 
 ## Benchmarks, Pi class (measured)
-Pi: aarch64, 4 cores, MemAvailable 3.46 GiB at start, `/var/tmp` on **a USB-attached SSD (sda, ROTA 0), NOT an SD
-card** (fsync here is ~4.5 ms; an SD card is likely slower and was NOT measured), GOMAXPROCS=2, `systemd-run` unit
+Pi: aarch64, 4 cores, MemAvailable 3.46 GiB at start, `/var/tmp` on **a USB-attached SSD (sda, ROTA 0)**, which is
+the Pi-class storage (user rule 2026-11-26: the Pis run on SSD, never SD cards; fsync ~4.5 ms), GOMAXPROCS=2, `systemd-run` unit
 MemoryMax=1G CPUQuota=200% AllowedCPUs=2-3 RuntimeMaxSec capped, 300 bodies x count 5 (drain: 1000 rows x 3), medians.
 "Before" = `eventoutbox.BatchOutbox` carrying the same body base64-wrapped in a JSON object (the rejected option).
 Bodies are incompressible random bytes (like gzip).
@@ -87,9 +87,8 @@ no more than the JSON one. Post-fix Pi drain, blobqueue / before: 1 KiB 8807 / 3
   + checkpoint copy). Equal to the baseline at 1 KiB, 19% less at 64 KiB (no base64).
 - The durable cost floor is one fsync (~4.5 ms on this USB SSD) per body: 134-194 bodies/s per writer, i.e. above the
   brief's 10-100 bodies/s ceiling at every size here (64 KiB FULL: 1.4x). **Group commit was NOT built** on that
-  measurement. It is NOT proven for an SD-card node: before enabling FULL on one, re-run `BenchmarkBlobEnqueue/*/FULL`
-  there; build group commit (concurrent `Enqueue` callers share one transaction, no API change) only if the measured
-  ceiling is under 2x that node's real rate. Open for otel-orch: which Pi-class nodes keep the queue on mmcblk.
+  measurement, on the Pi-class (SSD) storage the fleet uses. If a node class ever measures under 2x its real rate,
+  build it (concurrent `Enqueue` callers share one transaction, no API change) and re-benchmark first.
 - Variance caveat: Pi NORMAL runs spread up to 2.8x run to run (1 KiB NORMAL: 1018..2815 bodies/s), and a first run of
   a fresh process on the dev host measured 7.3 ms/enqueue vs 1.5 ms on rerun. The 1 KiB NORMAL "-15%" vs the baseline is
   inside that noise and is not claimed as a regression. No threshold was changed; no fix was needed from the numbers.
