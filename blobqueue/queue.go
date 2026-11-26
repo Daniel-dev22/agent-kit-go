@@ -24,6 +24,8 @@ var (
 	ErrClosed = errors.New("blobqueue: closed")
 	// ErrNotWAL: the caller's database is not in WAL mode (set journal_mode=WAL in the DSN).
 	ErrNotWAL = errors.New("blobqueue: database must use journal_mode=WAL")
+	// ErrRunning: a second Run while one is active.
+	ErrRunning = errors.New("blobqueue: Run is already active")
 )
 
 // Config configures a Queue. Zero values take the defaults in the comments; a negative bound disables it.
@@ -64,6 +66,7 @@ type DeadLetter struct {
 	Seq    uint64
 	Signal string
 	Code   string
+	Body   []byte // set only for a refused loss marker, whose JSON is the sole durable loss record
 }
 
 // Queue is the durable queue. Safe for concurrent Enqueue; one Run at a time.
@@ -91,6 +94,8 @@ type Queue struct {
 	shedByteTotal                           atomic.Int64
 	refused, dead, sent                     atomic.Int64
 	statfsErrs                              atomic.Int64 // sticky: while it grows the floor is silently off
+	reclaimErrs                             atomic.Int64 // sticky: vacuum/checkpoint failures; shedding may free no disk
+	running                                 atomic.Bool  // one Run at a time
 	lastErr                                 atomic.Value // string
 }
 
@@ -128,25 +133,8 @@ func New(db *sql.DB, cfg Config) (*Queue, error) {
 		q.durability = "weak"
 	}
 
-	// auto_vacuum is chosen per connection and only takes effect when the tables are created (or on
-	// VACUUM), so the pragma, the schema and the VACUUM must share ONE pooled connection.
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("blobqueue: conn: %w", err)
-	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, `PRAGMA auto_vacuum=INCREMENTAL`); err != nil {
-		return nil, fmt.Errorf("blobqueue: auto_vacuum: %w", err)
-	}
-	if err := q.initSchema(ctx, conn); err != nil {
+	if err := q.prepareFile(ctx); err != nil {
 		return nil, err
-	}
-	var av int
-	if err := conn.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&av); err == nil && av != 2 {
-		// An existing database created without it: rebuild once so shedding can return space.
-		if _, err := conn.ExecContext(ctx, `VACUUM`); err != nil {
-			log.Warn("blobqueue: could not enable incremental vacuum; shedding will not shrink the file", "err", err)
-		}
 	}
 
 	q.path = cfg.Path
@@ -170,6 +158,34 @@ func New(db *sql.DB, cfg Config) (*Queue, error) {
 	}
 	q.insert = ins
 	return q, nil
+}
+
+// prepareFile runs the auto_vacuum pragma, the schema transaction and the one-time VACUUM on ONE
+// pinned connection (auto_vacuum is per connection and only takes effect at table creation or VACUUM),
+// and RELEASES it before returning: the caller's pool may be capped at one connection (the fleet's
+// SetMaxOpenConns(1)), so no other query may run while it is held.
+func (q *Queue) prepareFile(ctx context.Context) error {
+	conn, err := q.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("blobqueue: conn: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA auto_vacuum=INCREMENTAL`); err != nil {
+		return fmt.Errorf("blobqueue: auto_vacuum: %w", err)
+	}
+	if err := q.initSchema(ctx, conn); err != nil {
+		return err
+	}
+	var av int
+	if err := conn.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&av); err == nil && av != 2 {
+		// An existing database created without it: rebuild once so shedding can return space.
+		if _, err := conn.ExecContext(ctx, `VACUUM`); err != nil {
+			q.reclaimErrs.Add(1)
+			q.lastErr.Store("vacuum: " + err.Error())
+			q.log.Warn("blobqueue: could not enable incremental vacuum; shedding will not shrink the file", "err", err)
+		}
+	}
+	return nil
 }
 
 func (c Config) withDefaults() Config {

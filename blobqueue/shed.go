@@ -258,14 +258,37 @@ func (q *Queue) ensureFloor(ctx context.Context, size int64) error {
 		loss.count(q)
 		// Deleted pages sit on the freelist and in the WAL; without this the file never shrinks and a
 		// floor breach would shed the entire queue for nothing.
-		if _, err := q.db.ExecContext(ctx, `PRAGMA incremental_vacuum`); err != nil {
-			q.lastErr.Store("vacuum: " + err.Error())
-		}
-		if _, err := q.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-			q.lastErr.Store("checkpoint: " + err.Error())
-		}
+		q.reclaim(ctx)
 	}
 	return fmt.Errorf("%w (still below floor after shedding)", ErrDiskFloor)
+}
+
+// reclaim returns freed pages to the filesystem. incremental_vacuum yields ONE ROW PER FREED PAGE, so the
+// rows must be drained (a driver whose Exec steps the statement once would free a single page), and
+// wal_checkpoint reports busy in its result row, not as an error. Any failure is counted in
+// Stats.ReclaimErrs and LastError: shedding that frees no disk must be visible.
+func (q *Queue) reclaim(ctx context.Context) {
+	rs, err := q.db.QueryContext(ctx, `PRAGMA incremental_vacuum`)
+	if err == nil {
+		for rs.Next() {
+		}
+		err = rs.Err()
+		rs.Close()
+	}
+	if err != nil {
+		q.reclaimErrs.Add(1)
+		q.lastErr.Store("vacuum: " + err.Error())
+	}
+	var busy, logFrames, ckpt int
+	err = q.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &ckpt)
+	switch {
+	case err != nil:
+		q.reclaimErrs.Add(1)
+		q.lastErr.Store("checkpoint: " + err.Error())
+	case busy != 0:
+		q.reclaimErrs.Add(1)
+		q.lastErr.Store("checkpoint: busy, WAL not truncated (set busy_timeout in the DSN)")
+	}
 }
 
 // Maintain sheds rows older than MaxAge. Run calls it every pass; Enqueue calls it at most once a second.

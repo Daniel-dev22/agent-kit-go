@@ -44,6 +44,16 @@ are pointers and the batch is held unless the counts account for every item (an 
 (3) the floor test now asserts the MAIN file shrinks and `freelist_count`==0 (a WAL truncation alone cannot pass),
 and `auto_vacuum`==2 is asserted on a fresh and on a pre-existing file (pinned `sql.Conn`); (4) `Stats.StatfsErrs`
 is a sticky counter so a silently disabled floor stays visible.
+Opus round 1 (frozen 4cde1cc; report otel-w2-review-r1.md): 1 HIGH, 1 MED, 7 LOW, no silent-loss path found. Fixed:
+HIGH `New` held a pinned conn while querying through the pool and hung forever under `SetMaxOpenConns(1)` (the fleet's
+setting): now released in `prepareFile`, with a one-connection-pool life-cycle test (incl. floor shed); MED
+`incremental_vacuum` yields one row per page so it is read via Query and drained, and the checkpoint's busy flag is
+checked; LOW vacuum/checkpoint failures counted in sticky `Stats.ReclaimErrs`; second `Run` refused (`ErrRunning`); a
+refused loss marker's body is handed to `OnDead` (`DeadLetter.Body`); test asserts the frame epoch. 37 tests, 21/21
+mutants, coverage 87.4%, fuzz smoke 648k execs clean. DEFERRED with reason (design choices, LOW, need weeks of outage):
+loss markers have no own bound (cap = a policy choice between durability and size; stage 2 decides with the receiver);
+age shedding trusts the wall clock (a Pi clock step mis-sheds, counted as `age`, never silent; fixing needs a monotonic
+or boot-id stamp, a schema change). Hot paths (Enqueue/drain) were not touched, so the Pi numbers above stand.
 What resets on restart: the in-memory shed/refused/sent/dead counters and the pending refusal count. The durable
 record of loss is the marker row (totals are re-derived at `New`).
 

@@ -12,7 +12,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-TESTS = r"Cap|Age|Floor|Marker|Inflight|Ack|Statfs|Vacuum|Sticky"
+TESTS = r"Cap|Age|Floor|Marker|Inflight|Ack|Statfs|Vacuum|Sticky|OneConnection|SecondRun|Reclaim|Epoch"
 
 # (file, original, mutant, what it breaks)
 MUTANTS = [
@@ -34,14 +34,21 @@ MUTANTS = [
     ("drain.go", "if a.Accepted == nil || a.Duplicate == nil {", "if a.Accepted == nil && a.Duplicate == nil {", "partial ack accepted"),
     ("drain.go", "+len(a.Rejected) != len(rows) {", "+len(a.Rejected) == len(rows) {", "ack count check inverted"),
     ("shed.go", "q.statfsErrs.Add(1)", "q.statfsErrs.Add(0)", "statfs failures not counted"),
+    ("queue.go", "defer conn.Close()", "_ = conn", "pinned connection never released (hangs on a one-connection pool)"),
+    ("drain.go", "if !q.running.CompareAndSwap(false, true) {", "if q.running.CompareAndSwap(false, true) {", "second Run not refused"),
+    ("shed.go", "q.reclaimErrs.Add(1)\n\t\tq.lastErr.Store(\"vacuum: \" + err.Error())\n\t}", "q.lastErr.Store(\"vacuum: \" + err.Error())\n\t}", "vacuum failure not counted"),
 ]
 
 
 def run(env):
-    return subprocess.run(
-        ["go", "-C", ROOT, "test", "-count=1", "-run", TESTS, "./blobqueue/"],
-        env=env, capture_output=True, text=True, timeout=300,
-    )
+    try:
+        return subprocess.run(
+            ["go", "-C", ROOT, "test", "-count=1", "-timeout=120s", "-run", TESTS, "./blobqueue/"],
+            env=env, capture_output=True, text=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        # A mutant that makes the tests hang is detected (the suite never passes with it).
+        return subprocess.CompletedProcess([], 1, "", "timeout")
 
 
 def main():

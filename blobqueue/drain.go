@@ -68,6 +68,12 @@ type qrow struct {
 // Run drains the queue oldest-first until ctx ends: it sends a batch, deletes what the receiver
 // acknowledged, and backs off with jitter on failure. A retryable per-item rejection holds that row.
 func (q *Queue) Run(ctx context.Context, send Sender) error {
+	// A second concurrent Run would send the same head batch and its release() would clear the
+	// in-flight mark under the first, letting shedding delete rows still in flight.
+	if !q.running.CompareAndSwap(false, true) {
+		return ErrRunning
+	}
+	defer q.running.Store(false)
 	failures := 0
 	failing := false
 	timer := time.NewTimer(time.Hour)
@@ -182,7 +188,11 @@ func (q *Queue) drainOnce(ctx context.Context, send Sender) (int, error) {
 		}
 		for _, r := range rows {
 			if r.Seq == rj.Seq {
-				dead = append(dead, DeadLetter{Seq: r.Seq, Signal: r.Signal, Code: rj.Code})
+				d := DeadLetter{Seq: r.Seq, Signal: r.Signal, Code: rj.Code}
+				if r.protected {
+					d.Body = r.Body // a refused loss marker is the only durable loss record: hand it to OnDead
+				}
+				dead = append(dead, d)
 			}
 		}
 	}
@@ -298,21 +308,22 @@ func deleteChunk(ctx context.Context, tx *sql.Tx, rows []qrow) error {
 
 // Stats is a point-in-time view, shaped for a metrics exporter.
 type Stats struct {
-	Epoch      string
-	Durability string // "full" | "normal" | "weak" (read back from the caller's database at New)
-	Rows       int64  // depth, including a loss marker
-	Bytes      int64  // logical bytes queued
-	OldestAge  time.Duration
-	ShedAge    int64 // rows shed, by reason
-	ShedRows   int64
-	ShedBytes  int64
-	ShedFloor  int64
-	ShedByte   int64 // logical bytes shed, all reasons
-	Refused    int64 // Enqueue calls refused at the free-disk floor
-	StatfsErrs int64 // sticky count of failed free-space reads; while it grows the floor is silently OFF
-	Sent       int64
-	Dead       int64
-	LastError  string
+	Epoch       string
+	Durability  string // "full" | "normal" | "weak" (read back from the caller's database at New)
+	Rows        int64  // depth, including a loss marker
+	Bytes       int64  // logical bytes queued
+	OldestAge   time.Duration
+	ShedAge     int64 // rows shed, by reason
+	ShedRows    int64
+	ShedBytes   int64
+	ShedFloor   int64
+	ShedByte    int64 // logical bytes shed, all reasons
+	Refused     int64 // Enqueue calls refused at the free-disk floor
+	StatfsErrs  int64 // sticky count of failed free-space reads; while it grows the floor is silently OFF
+	ReclaimErrs int64 // sticky count of failed vacuum/checkpoint; shedding may be freeing no disk
+	Sent        int64
+	Dead        int64
+	LastError   string
 }
 
 // Stats returns the current counters; the oldest-row age costs one indexed read.
@@ -324,7 +335,7 @@ func (q *Queue) Stats(ctx context.Context) Stats {
 		Epoch: q.epoch, Durability: q.durability, Rows: rows, Bytes: bytes,
 		ShedAge: q.shedAge.Load(), ShedRows: q.shedRows.Load(), ShedBytes: q.shedBytes.Load(),
 		ShedFloor: q.shedFloor.Load(), ShedByte: q.shedByteTotal.Load(),
-		Refused: q.refused.Load(), Sent: q.sent.Load(), Dead: q.dead.Load(), StatfsErrs: q.statfsErrs.Load(),
+		Refused: q.refused.Load(), Sent: q.sent.Load(), Dead: q.dead.Load(), StatfsErrs: q.statfsErrs.Load(), ReclaimErrs: q.reclaimErrs.Load(),
 	}
 	s.LastError, _ = q.lastErr.Load().(string)
 	var created int64
